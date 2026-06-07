@@ -1,56 +1,132 @@
 ﻿using System.Drawing;
 using System.Drawing.Imaging;
-using ILGPU;
-using ILGPU.Runtime;
-using ILGPU.Runtime.Cuda;
-using ILGPU.Runtime.OpenCL;
+using System.Diagnostics;
 
-const int Superpixels = 500; // Number of superpixels. Higher = smaller regions, more detail.
-const int Iterations = 8; // SLIC update rounds. Higher = more stable, but slower.
-const float Compactness = 10f; // Shape control. Higher = smoother/squarer superpixels, lower = follows edges more.
-const float TumorSensitivity = 1.2f; // Tumor threshold strictness. Higher = fewer highlighted areas, lower = more sensitive.
-const float TumorPercentile = 88f; // Keeps only bright superpixels above this percentile. Higher = fewer candidates.
-const float BrainRadiusFactor = 0.30f; // Removes far outer regions. Lower = stricter against skull/skin edge.
-const bool UseBrainRoi = true; // true = only search inside the brain ROI below.
-const float BrainRoiLeft = 0.28f; // ROI left boundary as image width ratio. Lower if tumor is missed on the left.
-const float BrainRoiTop = 0.08f; // ROI top boundary as image height ratio. Increase to ignore top skull edge.
-const float BrainRoiRight = 0.92f; // ROI right boundary as image width ratio. Lower to ignore right skull edge.
-const float BrainRoiBottom = 0.72f; // ROI bottom boundary as image height ratio. Lower to ignore face/neck areas.
-const string InputImagePath = @"E:\TPC SPL\Tr-no_8.jpg";
-const string OutputFolderPath = @"E:\TPC Project (SLI)\output";
+const int Superpixels = 500;              // Number of superpixels. Higher = smaller regions, more detail.
+const int Iterations = 8;                 // SLIC update rounds. Higher = more stable, but slower.
+const float Compactness = 10f;            // Shape control. Higher = smoother/squarer superpixels, lower = follows edges more.
 
-if (string.IsNullOrWhiteSpace(InputImagePath))
-    throw new ArgumentException("Please set InputImagePath in Program.cs.");
+const float TumorSensitivity = 0.7f;      // Tumor threshold strictness. Higher = fewer highlighted areas, lower = more sensitive.
+const float TumorPercentile = 75f;        // Keeps only bright superpixels above this percentile. Higher = fewer candidates.
+const float BrainRadiusFactor = 0.30f;    // Removes far outer regions. Lower = stricter against skull/skin edge.
 
-string inputPath = Path.GetFullPath(InputImagePath);
-if (!File.Exists(inputPath))
-    throw new FileNotFoundException("Input image was not found.", inputPath);
+const bool UseBrainRoi = true;            // true = only search inside the brain ROI below.
+const float BrainRoiLeft = 0.56f;         // ROI left boundary as image width ratio. Lower if tumor is missed on the left.
+const float BrainRoiTop = 0.41f;          // ROI top boundary as image height ratio. Increase to ignore top skull edge.
+const float BrainRoiRight = 0.65f;        // ROI right boundary as image width ratio. Lower to ignore right skull edge.
+const float BrainRoiBottom = 0.49f;       // ROI bottom boundary as image height ratio. Lower to ignore face/neck areas.
+
+const string InputFolderPath = @"E:\TPC Preprocessing\Preprocess Dataset"; // Put the folder containing preprocessed grayscale images here.
+const string OutputFolderPath = @"E:\SLI_CPU\output";
+
+Stopwatch executionStopwatch = Stopwatch.StartNew();
+
+if (string.IsNullOrWhiteSpace(InputFolderPath))
+    throw new ArgumentException("Please set InputFolderPath in Program.cs.");
+
+string inputFolder = Path.GetFullPath(InputFolderPath);
+if (!Directory.Exists(inputFolder))
+    throw new DirectoryNotFoundException("Input folder was not found: " + inputFolder);
 
 string outputDir = string.IsNullOrWhiteSpace(OutputFolderPath)
-    ? Path.GetDirectoryName(inputPath)!
+    ? inputFolder
     : Path.GetFullPath(OutputFolderPath);
 Directory.CreateDirectory(outputDir);
 
-ImageData image = LoadImage(inputPath);
-Console.WriteLine("Image: " + inputPath);
-Console.WriteLine("Size: " + image.Width + " x " + image.Height);
+string[] inputPaths = Directory
+    .EnumerateFiles(inputFolder)
+    .Where(IsSupportedImage)
+    .OrderBy(path => path)
+    .ToArray();
 
-int[] labels = RunGpuSlic(image);
-bool[] tumorMask = DetectTumorCandidates(image, labels);
+if (inputPaths.Length == 0)
+    throw new ArgumentException("No input images were found in: " + inputFolder);
 
-string outputPath = Path.Combine(
-    outputDir,
-    Path.GetFileNameWithoutExtension(inputPath) + "_tumor_candidate.jpg");
+double totalProcessingTimeMs = 0;
+double totalImageExecutionTimeMs = 0;
+double minProcessingTimeMs = double.MaxValue;
+double maxProcessingTimeMs = 0;
+double minExecutionTimeMs = double.MaxValue;
+double maxExecutionTimeMs = 0;
 
-SaveTumorOverlay(outputPath, image, tumorMask);
-Console.WriteLine("Output: " + outputPath);
+foreach (string inputPath in inputPaths)
+{
+    Stopwatch imageExecutionStopwatch = Stopwatch.StartNew();
+    ImageData image = LoadPreprocessedImage(inputPath);
+    Console.WriteLine("Preprocessed image: " + inputPath);
+    Console.WriteLine("Size: " + image.Width + " x " + image.Height);
 
-static ImageData LoadImage(string path)
+    Stopwatch processingStopwatch = Stopwatch.StartNew();
+    int[] labels = RunCpuParallelSlic(image);
+    bool[] tumorMask = DetectTumorCandidates(image, labels);
+    processingStopwatch.Stop();
+
+    double processingTimeMs = processingStopwatch.Elapsed.TotalMilliseconds;
+    totalProcessingTimeMs += processingTimeMs;
+    minProcessingTimeMs = Math.Min(minProcessingTimeMs, processingTimeMs);
+    maxProcessingTimeMs = Math.Max(maxProcessingTimeMs, processingTimeMs);
+
+    string outputPath = Path.Combine(
+        outputDir,
+        Path.GetFileNameWithoutExtension(inputPath) + "_tumor_candidate.jpg");
+
+    SaveTumorOverlay(outputPath, image, tumorMask);
+    imageExecutionStopwatch.Stop();
+
+    double imageExecutionTimeMs = imageExecutionStopwatch.Elapsed.TotalMilliseconds;
+    totalImageExecutionTimeMs += imageExecutionTimeMs;
+    minExecutionTimeMs = Math.Min(minExecutionTimeMs, imageExecutionTimeMs);
+    maxExecutionTimeMs = Math.Max(maxExecutionTimeMs, imageExecutionTimeMs);
+
+    Console.WriteLine("Output: " + outputPath);
+}
+
+executionStopwatch.Stop();
+PrintOverallPerformance(
+    "CPU",
+    totalProcessingTimeMs,
+    executionStopwatch.Elapsed.TotalMilliseconds,
+    totalImageExecutionTimeMs,
+    minProcessingTimeMs,
+    maxProcessingTimeMs,
+    minExecutionTimeMs,
+    maxExecutionTimeMs,
+    inputPaths.Length);
+
+static void PrintOverallPerformance(
+    string label,
+    double processingTimeMs,
+    double executionTimeMs,
+    double imageExecutionTimeMs,
+    double minProcessingTimeMs,
+    double maxProcessingTimeMs,
+    double minExecutionTimeMs,
+    double maxExecutionTimeMs,
+    int imageCount)
+{
+    double averageProcessingTimeMs = processingTimeMs / imageCount;
+    double averageExecutionTimeMs = imageExecutionTimeMs / imageCount;
+
+    Console.WriteLine($"{label} overall processing time: {processingTimeMs:F2} ms");
+    Console.WriteLine($"{label} average processing time: {averageProcessingTimeMs:F2} ms");
+    Console.WriteLine($"{label} min processing time: {minProcessingTimeMs:F2} ms");
+    Console.WriteLine($"{label} max processing time: {maxProcessingTimeMs:F2} ms");
+    Console.WriteLine($"{label} overall execution time: {executionTimeMs:F2} ms");
+    Console.WriteLine($"{label} average execution time: {averageExecutionTimeMs:F2} ms");
+    Console.WriteLine($"{label} min execution time: {minExecutionTimeMs:F2} ms");
+    Console.WriteLine($"{label} max execution time: {maxExecutionTimeMs:F2} ms");
+}
+
+static bool IsSupportedImage(string path)
+{
+    string ext = Path.GetExtension(path).ToLowerInvariant();
+    return ext is ".jpg" or ".jpeg" or ".png" or ".bmp";
+}
+
+static ImageData LoadPreprocessedImage(string path)
 {
     using Bitmap source = new Bitmap(path);
-    using Bitmap bitmap = new Bitmap(source.Width, source.Height, PixelFormat.Format24bppRgb);
-    using Graphics graphics = Graphics.FromImage(bitmap);
-    graphics.DrawImage(source, new Rectangle(0, 0, bitmap.Width, bitmap.Height));
+    using Bitmap bitmap = ConvertTo24BitRgb(source);
 
     int w = bitmap.Width, h = bitmap.Height, n = w * h;
     byte[] r = new byte[n], g = new byte[n], b = new byte[n];
@@ -66,10 +142,11 @@ static ImageData LoadImage(string path)
             for (int x = 0; x < w; x++)
             {
                 int i = y * w + x, p = x * 3;
-                b[i] = row[p];
-                g[i] = row[p + 1];
-                r[i] = row[p + 2];
-                gray[i] = (r[i] + g[i] + b[i]) / 3f;
+                byte grayValue = row[p]; // Preprocessing has already made R, G, and B equal.
+                b[i] = grayValue;
+                g[i] = grayValue;
+                r[i] = grayValue;
+                gray[i] = grayValue;
             }
         }
     }
@@ -77,59 +154,69 @@ static ImageData LoadImage(string path)
     return new ImageData(w, h, r, g, b, gray);
 }
 
-static int[] RunGpuSlic(ImageData image)
+static Bitmap ConvertTo24BitRgb(Bitmap source)
+{
+    Bitmap bitmap = new Bitmap(source.Width, source.Height, PixelFormat.Format24bppRgb);
+    using Graphics graphics = Graphics.FromImage(bitmap);
+    graphics.DrawImage(source, new Rectangle(0, 0, source.Width, source.Height));
+    return bitmap;
+}
+
+static int[] RunCpuParallelSlic(ImageData image)
 {
     int n = image.Width * image.Height;
     int step = Math.Max(1, (int)Math.Sqrt(n / (double)Superpixels));
     List<Center> centers = CreateCenters(image, step);
     int[] labels = new int[n];
+    float[] centerGray = new float[centers.Count];
+    float[] centerX = new float[centers.Count];
+    float[] centerY = new float[centers.Count];
+    int searchRadius = step * 2;
+    float spatialWeight = Compactness * Compactness / (step * step);
 
-    using Context context = Context.CreateDefault();
-    Device device = PickGpuDevice(context);
-    using Accelerator accelerator = device.CreateAccelerator(context);
-    Console.WriteLine("ILGPU accelerator: " + accelerator);
-
-    using MemoryBuffer1D<float, Stride1D.Dense> dGray = accelerator.Allocate1D(image.Gray);
-    using MemoryBuffer1D<float, Stride1D.Dense> dCg = accelerator.Allocate1D<float>(centers.Count);
-    using MemoryBuffer1D<float, Stride1D.Dense> dCx = accelerator.Allocate1D<float>(centers.Count);
-    using MemoryBuffer1D<float, Stride1D.Dense> dCy = accelerator.Allocate1D<float>(centers.Count);
-    using MemoryBuffer1D<int, Stride1D.Dense> dLabels = accelerator.Allocate1D<int>(n);
-
-    var kernel = accelerator.LoadAutoGroupedStreamKernel<Index1D, SlicViews, SlicSettings>(AssignLabelsKernel);
-    float[] cg = new float[centers.Count], cx = new float[centers.Count], cy = new float[centers.Count];
+    Console.WriteLine("CPU backend: Parallel.For");
 
     for (int iter = 0; iter < Iterations; iter++)
     {
         for (int i = 0; i < centers.Count; i++)
         {
-            cg[i] = centers[i].Gray;
-            cx[i] = centers[i].X;
-            cy[i] = centers[i].Y;
+            centerGray[i] = centers[i].Gray;
+            centerX[i] = centers[i].X;
+            centerY[i] = centers[i].Y;
         }
 
-        dCg.CopyFromCPU(cg);
-        dCx.CopyFromCPU(cx);
-        dCy.CopyFromCPU(cy);
+        Parallel.For(0, n, pixel =>
+        {
+            int x = pixel % image.Width;
+            int y = pixel / image.Width;
+            float best = float.MaxValue;
+            int bestLabel = 0;
 
-        kernel(n, new SlicViews(dGray.View, dCg.View, dCx.View, dCy.View, dLabels.View),
-            new SlicSettings(image.Width, centers.Count, step * 2, Compactness * Compactness / (step * step)));
-        accelerator.Synchronize();
-        dLabels.CopyToCPU(labels);
+            for (int c = 0; c < centers.Count; c++)
+            {
+                float dx = x - centerX[c];
+                float dy = y - centerY[c];
+
+                if (dx > searchRadius || dx < -searchRadius || dy > searchRadius || dy < -searchRadius)
+                    continue;
+
+                float dg = image.Gray[pixel] - centerGray[c];
+                float distance = dg * dg + spatialWeight * (dx * dx + dy * dy);
+
+                if (distance < best)
+                {
+                    best = distance;
+                    bestLabel = c;
+                }
+            }
+
+            labels[pixel] = bestLabel;
+        });
+
         UpdateCenters(image, labels, centers);
     }
 
     return labels;
-}
-
-static Device PickGpuDevice(Context context)
-{
-    var cuda = context.GetCudaDevices();
-    if (cuda.Count > 0) return cuda[0];
-
-    var openCl = context.GetCLDevices();
-    if (openCl.Count > 0) return openCl[0];
-
-    throw new InvalidOperationException("No CUDA/OpenCL GPU device found. Please install NVIDIA CUDA driver or OpenCL runtime.");
 }
 
 static List<Center> CreateCenters(ImageData image, int step)
@@ -270,7 +357,7 @@ static bool IsBrainLabel(LabelStats s, BrainInfo brain)
     return s.TissueRatio >= 0.50f &&
            s.BorderRatio <= 0.30f &&
            s.BackgroundRatio <= 0.35f &&
-           s.OutsideRoiRatio <= 0.05f &&
+           s.OutsideRoiRatio <= 0.70f &&
            s.OutsideRatio <= 0.10f &&
            InsideBrainRoi((int)s.CenterX, (int)s.CenterY, brain) &&
            MathF.Sqrt(dx * dx + dy * dy) <= brain.Radius;
@@ -402,24 +489,6 @@ static float Percentile(List<float> sorted, float pct)
 
 static byte Blend(byte original, byte overlay) => (byte)(original * 0.55f + overlay * 0.45f);
 
-static void AssignLabelsKernel(Index1D pixel, SlicViews v, SlicSettings s)
-{
-    int i = pixel, x = i % s.Width, y = i / s.Width;
-    float best = float.MaxValue;
-    int bestLabel = 0;
-
-    for (int c = 0; c < s.CenterCount; c++)
-    {
-        float dx = x - v.CenterX[c], dy = y - v.CenterY[c];
-        if (dx > s.SearchRadius || dx < -s.SearchRadius || dy > s.SearchRadius || dy < -s.SearchRadius) continue;
-        float dg = v.Gray[i] - v.CenterGray[c];
-        float d = dg * dg + s.SpatialWeight * (dx * dx + dy * dy);
-        if (d < best) { best = d; bestLabel = c; }
-    }
-
-    v.Labels[i] = bestLabel;
-}
-
 record ImageData(int Width, int Height, byte[] R, byte[] G, byte[] B, float[] Gray);
 record struct Center(float Gray, float X, float Y);
 record struct BrainInfo(
@@ -445,12 +514,3 @@ class LabelStats
     public float OutsideRatio => Count == 0 ? 0 : OutsideRadius / (float)Count;
     public float OutsideRoiRatio => Count == 0 ? 0 : OutsideRoi / (float)Count;
 }
-
-public readonly record struct SlicViews(
-    ArrayView<float> Gray,
-    ArrayView<float> CenterGray,
-    ArrayView<float> CenterX,
-    ArrayView<float> CenterY,
-    ArrayView<int> Labels);
-
-public readonly record struct SlicSettings(int Width, int CenterCount, int SearchRadius, float SpatialWeight);
