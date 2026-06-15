@@ -1,7 +1,7 @@
 ﻿using System.Drawing;
 using System.Drawing.Imaging;
 
-const string InputFolderPath = @"E:\TPC SPL\Dataset"; // Put the folder containing original MRI images here.
+const string InputFolderPath = @"C:\Users\Nitro\Downloads\Brain MRI\Brain MRI\Training"; // Put the folder containing original MRI images here.
 const string OutputFolderPath = @"E:\TPC Preprocessing\Preprocess Dataset";
 
 if (string.IsNullOrWhiteSpace(InputFolderPath))
@@ -17,7 +17,7 @@ string outputDir = string.IsNullOrWhiteSpace(OutputFolderPath)
 Directory.CreateDirectory(outputDir);
 
 string[] inputPaths = Directory
-    .EnumerateFiles(inputFolder)
+    .EnumerateFiles(inputFolder, "*.*", SearchOption.AllDirectories)
     .Where(IsSupportedImage)
     .OrderBy(path => path)
     .ToArray();
@@ -31,8 +31,12 @@ foreach (string inputPath in inputPaths)
     Console.WriteLine("Image: " + inputPath);
     Console.WriteLine("Size: " + image.Width + " x " + image.Height);
 
+    string relativeFolder = Path.GetDirectoryName(Path.GetRelativePath(inputFolder, inputPath)) ?? "";
+    string outputSubFolder = Path.Combine(outputDir, relativeFolder);
+    Directory.CreateDirectory(outputSubFolder);
+
     string outputPath = Path.Combine(
-        outputDir,
+        outputSubFolder,
         Path.GetFileNameWithoutExtension(inputPath) + "_gray.png");
 
     SaveGrayscaleImage(outputPath, image);

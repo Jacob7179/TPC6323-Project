@@ -1,6 +1,9 @@
 ﻿using System.Drawing;
 using System.Drawing.Imaging;
 using System.Diagnostics;
+using BenchmarkDotNet.Attributes;
+using BenchmarkDotNet.Running;
+using Microsoft.ConcurrencyVisualizer.Instrumentation;
 
 const int Superpixels = 500;              // Number of superpixels. Higher = smaller regions, more detail.
 const int Iterations = 8;                 // SLIC update rounds. Higher = more stable, but slower.
@@ -18,8 +21,18 @@ const float BrainRoiBottom = 0.49f;       // ROI bottom boundary as image height
 
 const string InputFolderPath = @"E:\TPC Preprocessing\Preprocess Dataset"; // Put the folder containing preprocessed grayscale images here.
 const string OutputFolderPath = @"E:\SLI_CPU\output";
+const bool RunBenchmarkDotNet = false;   // Set true and click Run to execute BenchmarkDotNet instead of normal output generation.
+
+bool runOnce = args.Contains("--run-once", StringComparer.OrdinalIgnoreCase);
+if ((RunBenchmarkDotNet && !runOnce) || args.Contains("--benchmark", StringComparer.OrdinalIgnoreCase))
+{
+    BenchmarkRunner.Run<CpuSlicBenchmark>();
+    return;
+}
 
 Stopwatch executionStopwatch = Stopwatch.StartNew();
+using IDisposable applicationProfileSpan = EnterProfileSpan("CPU application execution");
+WriteProfileFlag("CPU application start");
 
 if (string.IsNullOrWhiteSpace(InputFolderPath))
     throw new ArgumentException("Please set InputFolderPath in Program.cs.");
@@ -34,7 +47,7 @@ string outputDir = string.IsNullOrWhiteSpace(OutputFolderPath)
 Directory.CreateDirectory(outputDir);
 
 string[] inputPaths = Directory
-    .EnumerateFiles(inputFolder)
+    .EnumerateFiles(inputFolder, "*.*", SearchOption.AllDirectories)
     .Where(IsSupportedImage)
     .OrderBy(path => path)
     .ToArray();
@@ -51,26 +64,58 @@ double maxExecutionTimeMs = 0;
 
 foreach (string inputPath in inputPaths)
 {
+    string imageName = Path.GetFileName(inputPath);
     Stopwatch imageExecutionStopwatch = Stopwatch.StartNew();
-    ImageData image = LoadPreprocessedImage(inputPath);
-    Console.WriteLine("Preprocessed image: " + inputPath);
-    Console.WriteLine("Size: " + image.Width + " x " + image.Height);
+    ImageData image;
+    int[] labels;
+    bool[] tumorMask;
+    string outputPath;
 
-    Stopwatch processingStopwatch = Stopwatch.StartNew();
-    int[] labels = RunCpuParallelSlic(image);
-    bool[] tumorMask = DetectTumorCandidates(image, labels);
-    processingStopwatch.Stop();
+    WriteProfileFlag("CPU image start: " + imageName);
+    using (EnterProfileSpan("CPU image: " + imageName))
+    {
+        using (EnterProfileSpan("CPU load image: " + imageName))
+        {
+            image = LoadPreprocessedImage(inputPath);
+        }
 
-    double processingTimeMs = processingStopwatch.Elapsed.TotalMilliseconds;
-    totalProcessingTimeMs += processingTimeMs;
-    minProcessingTimeMs = Math.Min(minProcessingTimeMs, processingTimeMs);
-    maxProcessingTimeMs = Math.Max(maxProcessingTimeMs, processingTimeMs);
+        Console.WriteLine("Preprocessed image: " + inputPath);
+        Console.WriteLine("Size: " + image.Width + " x " + image.Height);
 
-    string outputPath = Path.Combine(
-        outputDir,
-        Path.GetFileNameWithoutExtension(inputPath) + "_tumor_candidate.jpg");
+        Stopwatch processingStopwatch = Stopwatch.StartNew();
+        using (EnterProfileSpan("CPU processing: " + imageName))
+        {
+            using (EnterProfileSpan("CPU SLIC: " + imageName))
+            {
+                labels = RunCpuParallelSlic(image);
+            }
 
-    SaveTumorOverlay(outputPath, image, tumorMask);
+            using (EnterProfileSpan("CPU tumor detection: " + imageName))
+            {
+                tumorMask = DetectTumorCandidates(image, labels);
+            }
+        }
+        processingStopwatch.Stop();
+
+        double processingTimeMs = processingStopwatch.Elapsed.TotalMilliseconds;
+        totalProcessingTimeMs += processingTimeMs;
+        minProcessingTimeMs = Math.Min(minProcessingTimeMs, processingTimeMs);
+        maxProcessingTimeMs = Math.Max(maxProcessingTimeMs, processingTimeMs);
+
+        string relativeFolder = Path.GetDirectoryName(Path.GetRelativePath(inputFolder, inputPath)) ?? "";
+        string outputSubFolder = Path.Combine(outputDir, relativeFolder);
+        Directory.CreateDirectory(outputSubFolder);
+
+        outputPath = Path.Combine(
+            outputSubFolder,
+            Path.GetFileNameWithoutExtension(inputPath) + "_tumor_candidate.jpg");
+
+        using (EnterProfileSpan("CPU save output: " + imageName))
+        {
+            SaveTumorOverlay(outputPath, image, tumorMask);
+        }
+    }
+    WriteProfileFlag("CPU image end: " + imageName);
     imageExecutionStopwatch.Stop();
 
     double imageExecutionTimeMs = imageExecutionStopwatch.Elapsed.TotalMilliseconds;
@@ -82,7 +127,9 @@ foreach (string inputPath in inputPaths)
 }
 
 executionStopwatch.Stop();
-PrintOverallPerformance(
+WriteProfileFlag("CPU application end");
+
+PrintBenchmark(
     "CPU",
     totalProcessingTimeMs,
     executionStopwatch.Elapsed.TotalMilliseconds,
@@ -93,7 +140,7 @@ PrintOverallPerformance(
     maxExecutionTimeMs,
     inputPaths.Length);
 
-static void PrintOverallPerformance(
+static void PrintBenchmark(
     string label,
     double processingTimeMs,
     double executionTimeMs,
@@ -107,6 +154,7 @@ static void PrintOverallPerformance(
     double averageProcessingTimeMs = processingTimeMs / imageCount;
     double averageExecutionTimeMs = imageExecutionTimeMs / imageCount;
 
+    Console.WriteLine($"{label} benchmark:");
     Console.WriteLine($"{label} overall processing time: {processingTimeMs:F2} ms");
     Console.WriteLine($"{label} average processing time: {averageProcessingTimeMs:F2} ms");
     Console.WriteLine($"{label} min processing time: {minProcessingTimeMs:F2} ms");
@@ -115,6 +163,16 @@ static void PrintOverallPerformance(
     Console.WriteLine($"{label} average execution time: {averageExecutionTimeMs:F2} ms");
     Console.WriteLine($"{label} min execution time: {minExecutionTimeMs:F2} ms");
     Console.WriteLine($"{label} max execution time: {maxExecutionTimeMs:F2} ms");
+}
+
+static IDisposable EnterProfileSpan(string name)
+{
+    return Markers.EnterSpan(name);
+}
+
+static void WriteProfileFlag(string message)
+{
+    Markers.WriteFlag(message);
 }
 
 static bool IsSupportedImage(string path)
@@ -489,6 +547,39 @@ static float Percentile(List<float> sorted, float pct)
 
 static byte Blend(byte original, byte overlay) => (byte)(original * 0.55f + overlay * 0.45f);
 
+public class CpuSlicBenchmark
+{
+    [Benchmark]
+    public void FullApplicationExecution()
+    {
+        BenchmarkProcessRunner.RunCurrentAssembly();
+    }
+}
+
+static class BenchmarkProcessRunner
+{
+    public static void RunCurrentAssembly()
+    {
+        string assemblyPath = typeof(BenchmarkProcessRunner).Assembly.Location;
+        ProcessStartInfo startInfo = new("dotnet");
+        startInfo.ArgumentList.Add(assemblyPath);
+        startInfo.ArgumentList.Add("--run-once");
+        startInfo.UseShellExecute = false;
+        startInfo.RedirectStandardOutput = true;
+        startInfo.RedirectStandardError = true;
+
+        using Process? process = Process.Start(startInfo);
+        if (process is null)
+            throw new InvalidOperationException("Failed to start benchmark process.");
+
+        string output = process.StandardOutput.ReadToEnd();
+        string error = process.StandardError.ReadToEnd();
+        process.WaitForExit();
+
+        if (process.ExitCode != 0)
+            throw new InvalidOperationException("Benchmark process failed: " + error + output);
+    }
+}
 record ImageData(int Width, int Height, byte[] R, byte[] G, byte[] B, float[] Gray);
 record struct Center(float Gray, float X, float Y);
 record struct BrainInfo(
