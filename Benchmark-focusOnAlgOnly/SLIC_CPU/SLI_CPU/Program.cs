@@ -1,38 +1,34 @@
 ﻿using System.Drawing;
 using System.Drawing.Imaging;
 using System.Diagnostics;
-using ILGPU;
-using ILGPU.Runtime;
-using ILGPU.Runtime.Cuda;
-using ILGPU.Runtime.OpenCL;
 using BenchmarkDotNet.Attributes;
 using BenchmarkDotNet.Running;
-using Microsoft.ConcurrencyVisualizer.Instrumentation;
 
-const int Superpixels = 500; // Number of superpixels. Higher = smaller regions, more detail.
-const int Iterations = 8; // SLIC update rounds. Higher = more stable, but slower.
-const float Compactness = 10f; // Shape control. Higher = smoother/squarer superpixels, lower = follows edges more.
-const float TumorSensitivity = 0.7f; // Tumor threshold strictness. Higher = fewer highlighted areas, lower = more sensitive.
-const float TumorPercentile = 75f; // Keeps only bright superpixels above this percentile. Higher = fewer candidates.
-const float BrainRadiusFactor = 0.30f; // Removes far outer regions. Lower = stricter against skull/skin edge.
-const bool UseBrainRoi = true; // true = only search inside the brain ROI below.
-const float BrainRoiLeft = 0.56f; // ROI left boundary as image width ratio. Lower if tumor is missed on the left.
-const float BrainRoiTop = 0.41f; // ROI top boundary as image height ratio. Increase to ignore top skull edge.
-const float BrainRoiRight = 0.65f; // ROI right boundary as image width ratio. Lower to ignore right skull edge.
-const float BrainRoiBottom = 0.49f; // ROI bottom boundary as image height ratio. Lower to ignore face/neck areas.
+const int Superpixels = 500;              // Number of superpixels. Higher = smaller regions, more detail.
+const int Iterations = 8;                 // SLIC update rounds. Higher = more stable, but slower.
+const float Compactness = 10f;            // Shape control. Higher = smoother/squarer superpixels, lower = follows edges more.
+
+const float TumorSensitivity = 0.7f;      // Tumor threshold strictness. Higher = fewer highlighted areas, lower = more sensitive.
+const float TumorPercentile = 75f;        // Keeps only bright superpixels above this percentile. Higher = fewer candidates.
+const float BrainRadiusFactor = 0.30f;    // Removes far outer regions. Lower = stricter against skull/skin edge.
+
+const bool UseBrainRoi = true;            // true = only search inside the brain ROI below.
+const float BrainRoiLeft = 0.56f;         // ROI left boundary as image width ratio. Lower if tumor is missed on the left.
+const float BrainRoiTop = 0.41f;          // ROI top boundary as image height ratio. Increase to ignore top skull edge.
+const float BrainRoiRight = 0.65f;        // ROI right boundary as image width ratio. Lower to ignore right skull edge.
+const float BrainRoiBottom = 0.49f;       // ROI bottom boundary as image height ratio. Lower to ignore face/neck areas.
+
 const string InputFolderPath = @"E:\TPC Preprocessing\Preprocess Dataset"; // Put the folder containing preprocessed grayscale images here.
-const string OutputFolderPath = @"E:\TPC Project (SLI)\output";
-const bool RunBenchmarkDotNet = false; // Set true and click Run to execute BenchmarkDotNet instead of normal output generation.
+const string OutputFolderPath = @"E:\SLI_CPU\output";
+const bool RunBenchmarkDotNet = false;   // Set true and click Run to execute BenchmarkDotNet instead of normal output generation.
 
 bool runOnce = args.Contains("--run-once", StringComparer.OrdinalIgnoreCase);
 bool runSlicOnly = args.Contains("--slic-only", StringComparer.OrdinalIgnoreCase);
 if ((RunBenchmarkDotNet && !runOnce) || args.Contains("--benchmark", StringComparer.OrdinalIgnoreCase))
 {
-    BenchmarkRunner.Run<GpuSlicBenchmark>();
+    BenchmarkRunner.Run<CpuSlicBenchmark>();
     return;
 }
-
-WriteProfileFlag("GPU SLIC evaluation start");
 
 if (string.IsNullOrWhiteSpace(InputFolderPath))
     throw new ArgumentException("Please set InputFolderPath in Program.cs.");
@@ -55,12 +51,6 @@ string[] inputPaths = Directory
 if (inputPaths.Length == 0)
     throw new ArgumentException("No input images were found in: " + inputFolder);
 
-using (EnterProfileSpan("GPU warm-up"))
-{
-    ImageData warmupImage = LoadPreprocessedImage(inputPaths[0]);
-    RunGpuSlic(warmupImage); // Warm-up run for ILGPU kernel compilation. Do not include this in timing.
-}
-
 double totalProcessingTimeMs = 0;
 double totalExecutionTimeMs = 0;
 double minProcessingTimeMs = double.MaxValue;
@@ -81,24 +71,16 @@ foreach (string inputPath in inputPaths)
     Console.WriteLine("Preprocessed image: " + inputPath);
     Console.WriteLine("Size: " + image.Width + " x " + image.Height);
 
-    WriteProfileFlag("GPU SLIC start: " + imageName);
     Stopwatch executionStopwatch = Stopwatch.StartNew();
-    using (EnterProfileSpan("GPU SLIC execution: " + imageName))
-    {
-        Stopwatch processingStopwatch = Stopwatch.StartNew();
-        using (EnterProfileSpan("GPU SLIC processing: " + imageName))
-        {
-            labels = RunGpuSlic(image);
-        }
-        processingStopwatch.Stop();
+    Stopwatch processingStopwatch = Stopwatch.StartNew();
+    labels = RunCpuParallelSlic(image);
+    processingStopwatch.Stop();
 
-        double processingTimeMs = processingStopwatch.Elapsed.TotalMilliseconds;
-        totalProcessingTimeMs += processingTimeMs;
-        minProcessingTimeMs = Math.Min(minProcessingTimeMs, processingTimeMs);
-        maxProcessingTimeMs = Math.Max(maxProcessingTimeMs, processingTimeMs);
-    }
+    double processingTimeMs = processingStopwatch.Elapsed.TotalMilliseconds;
+    totalProcessingTimeMs += processingTimeMs;
+    minProcessingTimeMs = Math.Min(minProcessingTimeMs, processingTimeMs);
+    maxProcessingTimeMs = Math.Max(maxProcessingTimeMs, processingTimeMs);
     executionStopwatch.Stop();
-    WriteProfileFlag("GPU SLIC end: " + imageName);
 
     double executionTimeMs = executionStopwatch.Elapsed.TotalMilliseconds;
     totalExecutionTimeMs += executionTimeMs;
@@ -123,10 +105,8 @@ foreach (string inputPath in inputPaths)
     Console.WriteLine("Output: " + outputPath);
 }
 
-WriteProfileFlag("GPU SLIC evaluation end");
-
 PrintBenchmark(
-    "GPU",
+    "CPU",
     totalProcessingTimeMs,
     totalExecutionTimeMs,
     minProcessingTimeMs,
@@ -157,16 +137,6 @@ static void PrintBenchmark(
     Console.WriteLine($"{label} SLIC average execution time: {averageExecutionTimeMs:F2} ms");
     Console.WriteLine($"{label} SLIC min execution time: {minExecutionTimeMs:F2} ms");
     Console.WriteLine($"{label} SLIC max execution time: {maxExecutionTimeMs:F2} ms");
-}
-
-static IDisposable EnterProfileSpan(string name)
-{
-    return Markers.EnterSpan(name);
-}
-
-static void WriteProfileFlag(string message)
-{
-    Markers.WriteFlag(message);
 }
 
 static bool IsSupportedImage(string path)
@@ -214,59 +184,61 @@ static Bitmap ConvertTo24BitRgb(Bitmap source)
     return bitmap;
 }
 
-static int[] RunGpuSlic(ImageData image)
+static int[] RunCpuParallelSlic(ImageData image)
 {
     int n = image.Width * image.Height;
     int step = Math.Max(1, (int)Math.Sqrt(n / (double)Superpixels));
     List<Center> centers = CreateCenters(image, step);
     int[] labels = new int[n];
+    float[] centerGray = new float[centers.Count];
+    float[] centerX = new float[centers.Count];
+    float[] centerY = new float[centers.Count];
+    int searchRadius = step * 2;
+    float spatialWeight = Compactness * Compactness / (step * step);
 
-    using Context context = Context.CreateDefault();
-    Device device = PickGpuDevice(context);
-    using Accelerator accelerator = device.CreateAccelerator(context);
-    Console.WriteLine("ILGPU accelerator: " + accelerator);
-
-    using MemoryBuffer1D<float, Stride1D.Dense> dGray = accelerator.Allocate1D(image.Gray);
-    using MemoryBuffer1D<float, Stride1D.Dense> dCg = accelerator.Allocate1D<float>(centers.Count);
-    using MemoryBuffer1D<float, Stride1D.Dense> dCx = accelerator.Allocate1D<float>(centers.Count);
-    using MemoryBuffer1D<float, Stride1D.Dense> dCy = accelerator.Allocate1D<float>(centers.Count);
-    using MemoryBuffer1D<int, Stride1D.Dense> dLabels = accelerator.Allocate1D<int>(n);
-
-    var kernel = accelerator.LoadAutoGroupedStreamKernel<Index1D, SlicViews, SlicSettings>(AssignLabelsKernel);
-    float[] cg = new float[centers.Count], cx = new float[centers.Count], cy = new float[centers.Count];
+    Console.WriteLine("CPU backend: Parallel.For");
 
     for (int iter = 0; iter < Iterations; iter++)
     {
         for (int i = 0; i < centers.Count; i++)
         {
-            cg[i] = centers[i].Gray;
-            cx[i] = centers[i].X;
-            cy[i] = centers[i].Y;
+            centerGray[i] = centers[i].Gray;
+            centerX[i] = centers[i].X;
+            centerY[i] = centers[i].Y;
         }
 
-        dCg.CopyFromCPU(cg);
-        dCx.CopyFromCPU(cx);
-        dCy.CopyFromCPU(cy);
+        Parallel.For(0, n, pixel =>
+        {
+            int x = pixel % image.Width;
+            int y = pixel / image.Width;
+            float best = float.MaxValue;
+            int bestLabel = 0;
 
-        kernel(n, new SlicViews(dGray.View, dCg.View, dCx.View, dCy.View, dLabels.View),
-            new SlicSettings(image.Width, centers.Count, step * 2, Compactness * Compactness / (step * step)));
-        accelerator.Synchronize();
-        dLabels.CopyToCPU(labels);
+            for (int c = 0; c < centers.Count; c++)
+            {
+                float dx = x - centerX[c];
+                float dy = y - centerY[c];
+
+                if (dx > searchRadius || dx < -searchRadius || dy > searchRadius || dy < -searchRadius)
+                    continue;
+
+                float dg = image.Gray[pixel] - centerGray[c];
+                float distance = dg * dg + spatialWeight * (dx * dx + dy * dy);
+
+                if (distance < best)
+                {
+                    best = distance;
+                    bestLabel = c;
+                }
+            }
+
+            labels[pixel] = bestLabel;
+        });
+
         UpdateCenters(image, labels, centers);
     }
 
     return labels;
-}
-
-static Device PickGpuDevice(Context context)
-{
-    var cuda = context.GetCudaDevices();
-    if (cuda.Count > 0) return cuda[0];
-
-    var openCl = context.GetCLDevices();
-    if (openCl.Count > 0) return openCl[0];
-
-    throw new InvalidOperationException("No CUDA/OpenCL GPU device found. Please install NVIDIA CUDA driver or OpenCL runtime.");
 }
 
 static List<Center> CreateCenters(ImageData image, int step)
@@ -539,25 +511,7 @@ static float Percentile(List<float> sorted, float pct)
 
 static byte Blend(byte original, byte overlay) => (byte)(original * 0.55f + overlay * 0.45f);
 
-static void AssignLabelsKernel(Index1D pixel, SlicViews v, SlicSettings s)
-{
-    int i = pixel, x = i % s.Width, y = i / s.Width;
-    float best = float.MaxValue;
-    int bestLabel = 0;
-
-    for (int c = 0; c < s.CenterCount; c++)
-    {
-        float dx = x - v.CenterX[c], dy = y - v.CenterY[c];
-        if (dx > s.SearchRadius || dx < -s.SearchRadius || dy > s.SearchRadius || dy < -s.SearchRadius) continue;
-        float dg = v.Gray[i] - v.CenterGray[c];
-        float d = dg * dg + s.SpatialWeight * (dx * dx + dy * dy);
-        if (d < best) { best = d; bestLabel = c; }
-    }
-
-    v.Labels[i] = bestLabel;
-}
-
-public class GpuSlicBenchmark
+public class CpuSlicBenchmark
 {
     [Benchmark]
     public void SlicOnlyExecution()
@@ -616,12 +570,3 @@ class LabelStats
     public float OutsideRatio => Count == 0 ? 0 : OutsideRadius / (float)Count;
     public float OutsideRoiRatio => Count == 0 ? 0 : OutsideRoi / (float)Count;
 }
-
-public readonly record struct SlicViews(
-    ArrayView<float> Gray,
-    ArrayView<float> CenterGray,
-    ArrayView<float> CenterX,
-    ArrayView<float> CenterY,
-    ArrayView<int> Labels);
-
-public readonly record struct SlicSettings(int Width, int CenterCount, int SearchRadius, float SpatialWeight);

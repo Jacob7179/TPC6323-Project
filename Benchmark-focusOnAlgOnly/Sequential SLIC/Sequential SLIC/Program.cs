@@ -3,7 +3,6 @@ using System.Drawing.Imaging;
 using System.Diagnostics;
 using BenchmarkDotNet.Attributes;
 using BenchmarkDotNet.Running;
-using Microsoft.ConcurrencyVisualizer.Instrumentation;
 
 const int Superpixels = 500;              // Number of superpixels. Higher = smaller regions, more detail.
 const int Iterations = 8;                 // SLIC update rounds. Higher = more stable, but slower.
@@ -30,8 +29,6 @@ if ((RunBenchmarkDotNet && !runOnce) || args.Contains("--benchmark", StringCompa
     BenchmarkRunner.Run<SequentialSlicBenchmark>();
     return;
 }
-
-WriteProfileFlag("Sequential SLIC evaluation start");
 
 if (string.IsNullOrWhiteSpace(InputFolderPath))
     throw new ArgumentException("Please set InputFolderPath in Program.cs.");
@@ -74,24 +71,16 @@ foreach (string inputPath in inputPaths)
     Console.WriteLine("Preprocessed image: " + inputPath);
     Console.WriteLine("Size: " + image.Width + " x " + image.Height);
 
-    WriteProfileFlag("Sequential SLIC start: " + imageName);
     Stopwatch executionStopwatch = Stopwatch.StartNew();
-    using (EnterProfileSpan("Sequential SLIC execution: " + imageName))
-    {
-        Stopwatch processingStopwatch = Stopwatch.StartNew();
-        using (EnterProfileSpan("Sequential SLIC processing: " + imageName))
-        {
-            labels = RunSequentialSlic(image);
-        }
-        processingStopwatch.Stop();
+    Stopwatch processingStopwatch = Stopwatch.StartNew();
+    labels = RunSequentialSlic(image);
+    processingStopwatch.Stop();
 
-        double processingTimeMs = processingStopwatch.Elapsed.TotalMilliseconds;
-        totalProcessingTimeMs += processingTimeMs;
-        minProcessingTimeMs = Math.Min(minProcessingTimeMs, processingTimeMs);
-        maxProcessingTimeMs = Math.Max(maxProcessingTimeMs, processingTimeMs);
-    }
+    double processingTimeMs = processingStopwatch.Elapsed.TotalMilliseconds;
+    totalProcessingTimeMs += processingTimeMs;
+    minProcessingTimeMs = Math.Min(minProcessingTimeMs, processingTimeMs);
+    maxProcessingTimeMs = Math.Max(maxProcessingTimeMs, processingTimeMs);
     executionStopwatch.Stop();
-    WriteProfileFlag("Sequential SLIC end: " + imageName);
 
     double executionTimeMs = executionStopwatch.Elapsed.TotalMilliseconds;
     totalExecutionTimeMs += executionTimeMs;
@@ -115,8 +104,6 @@ foreach (string inputPath in inputPaths)
 
     Console.WriteLine("Output: " + outputPath);
 }
-
-WriteProfileFlag("Sequential SLIC evaluation end");
 
 PrintBenchmark(
     "Sequential",
@@ -150,16 +137,6 @@ static void PrintBenchmark(
     Console.WriteLine($"{label} SLIC average execution time: {averageExecutionTimeMs:F2} ms");
     Console.WriteLine($"{label} SLIC min execution time: {minExecutionTimeMs:F2} ms");
     Console.WriteLine($"{label} SLIC max execution time: {maxExecutionTimeMs:F2} ms");
-}
-
-static IDisposable EnterProfileSpan(string name)
-{
-    return Markers.EnterSpan(name);
-}
-
-static void WriteProfileFlag(string message)
-{
-    Markers.WriteFlag(message);
 }
 
 static bool IsSupportedImage(string path)
