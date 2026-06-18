@@ -30,113 +30,109 @@ if ((RunBenchmarkDotNet && !runOnce) || args.Contains("--benchmark", StringCompa
     return;
 }
 
-if (string.IsNullOrWhiteSpace(InputFolderPath))
-    throw new ArgumentException("Please set InputFolderPath in Program.cs.");
-
-string inputFolder = Path.GetFullPath(InputFolderPath);
-if (!Directory.Exists(inputFolder))
-    throw new DirectoryNotFoundException("Input folder was not found: " + inputFolder);
-
-string outputDir = string.IsNullOrWhiteSpace(OutputFolderPath)
-    ? inputFolder
-    : Path.GetFullPath(OutputFolderPath);
-Directory.CreateDirectory(outputDir);
-
-string[] inputPaths = Directory
-    .EnumerateFiles(inputFolder, "*.*", SearchOption.AllDirectories)
-    .Where(IsSupportedImage)
-    .OrderBy(path => path)
-    .ToArray();
-
-if (inputPaths.Length == 0)
-    throw new ArgumentException("No input images were found in: " + inputFolder);
-
-double totalProcessingTimeMs = 0;
-double totalExecutionTimeMs = 0;
-double minProcessingTimeMs = double.MaxValue;
-double maxProcessingTimeMs = 0;
-double minExecutionTimeMs = double.MaxValue;
-double maxExecutionTimeMs = 0;
+string inputFolder = ResolveInputFolder(InputFolderPath);
+string outputDir = PrepareOutputFolder(OutputFolderPath, inputFolder);
+string[] inputPaths = FindInputImages(inputFolder);
+BenchmarkSummary benchmark = new();
 
 foreach (string inputPath in inputPaths)
 {
-    string imageName = Path.GetFileName(inputPath);
-    ImageData image;
-    int[] labels;
-    bool[] tumorMask;
-    string outputPath;
-
-    image = LoadPreprocessedImage(inputPath);
-
-    Console.WriteLine("Preprocessed image: " + inputPath);
-    Console.WriteLine("Size: " + image.Width + " x " + image.Height);
-
-    Stopwatch executionStopwatch = Stopwatch.StartNew();
-    Stopwatch processingStopwatch = Stopwatch.StartNew();
-    labels = RunSequentialSlic(image);
-    processingStopwatch.Stop();
-
-    double processingTimeMs = processingStopwatch.Elapsed.TotalMilliseconds;
-    totalProcessingTimeMs += processingTimeMs;
-    minProcessingTimeMs = Math.Min(minProcessingTimeMs, processingTimeMs);
-    maxProcessingTimeMs = Math.Max(maxProcessingTimeMs, processingTimeMs);
-    executionStopwatch.Stop();
-
-    double executionTimeMs = executionStopwatch.Elapsed.TotalMilliseconds;
-    totalExecutionTimeMs += executionTimeMs;
-    minExecutionTimeMs = Math.Min(minExecutionTimeMs, executionTimeMs);
-    maxExecutionTimeMs = Math.Max(maxExecutionTimeMs, executionTimeMs);
+    ImageData image = LoadAndReportImage(inputPath);
+    TimedSlicResult result = RunTimedSlic(image, RunSequentialSlic);
+    benchmark.Add(result.Timing);
 
     if (runSlicOnly)
         continue;
 
-    tumorMask = DetectTumorCandidates(image, labels);
+    SaveTumorCandidateOutput(inputFolder, outputDir, inputPath, image, result.Labels);
+}
 
+PrintBenchmark("Sequential", benchmark);
+
+static string ResolveInputFolder(string inputFolderPath)
+{
+    if (string.IsNullOrWhiteSpace(inputFolderPath))
+        throw new ArgumentException("Please set InputFolderPath in Program.cs.");
+
+    string inputFolder = Path.GetFullPath(inputFolderPath);
+    if (!Directory.Exists(inputFolder))
+        throw new DirectoryNotFoundException("Input folder was not found: " + inputFolder);
+
+    return inputFolder;
+}
+
+static string PrepareOutputFolder(string outputFolderPath, string inputFolder)
+{
+    string outputDir = string.IsNullOrWhiteSpace(outputFolderPath)
+        ? inputFolder
+        : Path.GetFullPath(outputFolderPath);
+    Directory.CreateDirectory(outputDir);
+    return outputDir;
+}
+
+static string[] FindInputImages(string inputFolder)
+{
+    string[] inputPaths = Directory
+        .EnumerateFiles(inputFolder, "*.*", SearchOption.AllDirectories)
+        .Where(IsSupportedImage)
+        .OrderBy(path => path)
+        .ToArray();
+
+    if (inputPaths.Length == 0)
+        throw new ArgumentException("No input images were found in: " + inputFolder);
+
+    return inputPaths;
+}
+
+static ImageData LoadAndReportImage(string inputPath)
+{
+    ImageData image = LoadPreprocessedImage(inputPath);
+    Console.WriteLine("Preprocessed image: " + inputPath);
+    Console.WriteLine("Size: " + image.Width + " x " + image.Height);
+    return image;
+}
+
+static TimedSlicResult RunTimedSlic(ImageData image, Func<ImageData, int[]> runSlic)
+{
+    Stopwatch executionStopwatch = Stopwatch.StartNew();
+    Stopwatch processingStopwatch = Stopwatch.StartNew();
+    int[] labels = runSlic(image);
+    processingStopwatch.Stop();
+    executionStopwatch.Stop();
+
+    return new TimedSlicResult(
+        labels,
+        new SlicTiming(
+            processingStopwatch.Elapsed.TotalMilliseconds,
+            executionStopwatch.Elapsed.TotalMilliseconds));
+}
+
+static void SaveTumorCandidateOutput(string inputFolder, string outputDir, string inputPath, ImageData image, int[] labels)
+{
+    bool[] tumorMask = DetectTumorCandidates(image, labels);
     string relativeFolder = Path.GetDirectoryName(Path.GetRelativePath(inputFolder, inputPath)) ?? "";
     string outputSubFolder = Path.Combine(outputDir, relativeFolder);
     Directory.CreateDirectory(outputSubFolder);
 
-    outputPath = Path.Combine(
+    string outputPath = Path.Combine(
         outputSubFolder,
         Path.GetFileNameWithoutExtension(inputPath) + "_tumor_candidate.jpg");
 
     SaveTumorOverlay(outputPath, image, tumorMask);
-
     Console.WriteLine("Output: " + outputPath);
 }
 
-PrintBenchmark(
-    "Sequential",
-    totalProcessingTimeMs,
-    totalExecutionTimeMs,
-    minProcessingTimeMs,
-    maxProcessingTimeMs,
-    minExecutionTimeMs,
-    maxExecutionTimeMs,
-    inputPaths.Length);
-
-static void PrintBenchmark(
-    string label,
-    double processingTimeMs,
-    double executionTimeMs,
-    double minProcessingTimeMs,
-    double maxProcessingTimeMs,
-    double minExecutionTimeMs,
-    double maxExecutionTimeMs,
-    int imageCount)
+static void PrintBenchmark(string label, BenchmarkSummary benchmark)
 {
-    double averageProcessingTimeMs = processingTimeMs / imageCount;
-    double averageExecutionTimeMs = executionTimeMs / imageCount;
-
     Console.WriteLine($"{label} SLIC benchmark:");
-    Console.WriteLine($"{label} SLIC overall processing time: {processingTimeMs:F2} ms");
-    Console.WriteLine($"{label} SLIC average processing time: {averageProcessingTimeMs:F2} ms");
-    Console.WriteLine($"{label} SLIC min processing time: {minProcessingTimeMs:F2} ms");
-    Console.WriteLine($"{label} SLIC max processing time: {maxProcessingTimeMs:F2} ms");
-    Console.WriteLine($"{label} SLIC overall execution time: {executionTimeMs:F2} ms");
-    Console.WriteLine($"{label} SLIC average execution time: {averageExecutionTimeMs:F2} ms");
-    Console.WriteLine($"{label} SLIC min execution time: {minExecutionTimeMs:F2} ms");
-    Console.WriteLine($"{label} SLIC max execution time: {maxExecutionTimeMs:F2} ms");
+    Console.WriteLine($"{label} SLIC overall processing time: {benchmark.TotalProcessingTimeMs:F2} ms");
+    Console.WriteLine($"{label} SLIC average processing time: {benchmark.AverageProcessingTimeMs:F2} ms");
+    Console.WriteLine($"{label} SLIC min processing time: {benchmark.MinProcessingTimeMs:F2} ms");
+    Console.WriteLine($"{label} SLIC max processing time: {benchmark.MaxProcessingTimeMs:F2} ms");
+    Console.WriteLine($"{label} SLIC overall execution time: {benchmark.TotalExecutionTimeMs:F2} ms");
+    Console.WriteLine($"{label} SLIC average execution time: {benchmark.AverageExecutionTimeMs:F2} ms");
+    Console.WriteLine($"{label} SLIC min execution time: {benchmark.MinExecutionTimeMs:F2} ms");
+    Console.WriteLine($"{label} SLIC max execution time: {benchmark.MaxExecutionTimeMs:F2} ms");
 }
 
 static bool IsSupportedImage(string path)
@@ -545,6 +541,35 @@ static class BenchmarkProcessRunner
             throw new InvalidOperationException("Benchmark process failed: " + error + output);
     }
 }
+
+record struct SlicTiming(double ProcessingTimeMs, double ExecutionTimeMs);
+record struct TimedSlicResult(int[] Labels, SlicTiming Timing);
+
+class BenchmarkSummary
+{
+    public double TotalProcessingTimeMs { get; private set; }
+    public double TotalExecutionTimeMs { get; private set; }
+    public double MinProcessingTimeMs { get; private set; } = double.MaxValue;
+    public double MaxProcessingTimeMs { get; private set; }
+    public double MinExecutionTimeMs { get; private set; } = double.MaxValue;
+    public double MaxExecutionTimeMs { get; private set; }
+    public int Count { get; private set; }
+
+    public double AverageProcessingTimeMs => Count == 0 ? 0 : TotalProcessingTimeMs / Count;
+    public double AverageExecutionTimeMs => Count == 0 ? 0 : TotalExecutionTimeMs / Count;
+
+    public void Add(SlicTiming timing)
+    {
+        Count++;
+        TotalProcessingTimeMs += timing.ProcessingTimeMs;
+        TotalExecutionTimeMs += timing.ExecutionTimeMs;
+        MinProcessingTimeMs = Math.Min(MinProcessingTimeMs, timing.ProcessingTimeMs);
+        MaxProcessingTimeMs = Math.Max(MaxProcessingTimeMs, timing.ProcessingTimeMs);
+        MinExecutionTimeMs = Math.Min(MinExecutionTimeMs, timing.ExecutionTimeMs);
+        MaxExecutionTimeMs = Math.Max(MaxExecutionTimeMs, timing.ExecutionTimeMs);
+    }
+}
+
 record ImageData(int Width, int Height, byte[] R, byte[] G, byte[] B, float[] Gray);
 record struct Center(float Gray, float X, float Y);
 record struct BrainInfo(
