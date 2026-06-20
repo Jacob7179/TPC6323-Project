@@ -33,13 +33,46 @@ class Program
 
         bool runOnce = args.Contains("--run-once", StringComparer.OrdinalIgnoreCase);
 
+        // --------------------------------------------------
+        // Balanced dataset sampling from subfolders
+        // --------------------------------------------------
+        string inputFolder = Path.GetFullPath(BaseFolderPath);
         Directory.CreateDirectory(OutputFolderPath);
 
-        string[] files = Directory
-            .EnumerateFiles(BaseFolderPath, "*.*", SearchOption.AllDirectories)
+        string[] targetFolders = new[]
+        {
+            Path.Combine(inputFolder, "glioma"),
+            Path.Combine(inputFolder, "pituitary"),
+            Path.Combine(inputFolder, "meningioma")
+        };
+
+        var random = new Random(42); // fixed seed for reproducibility
+
+        string[] glioma = Directory.GetFiles(targetFolders[0], "*", SearchOption.AllDirectories)
             .Where(IsSupportedImage)
+            .OrderBy(_ => random.Next())
+            .Take(33)
             .ToArray();
 
+        string[] pituitary = Directory.GetFiles(targetFolders[1], "*", SearchOption.AllDirectories)
+            .Where(IsSupportedImage)
+            .OrderBy(_ => random.Next())
+            .Take(33)
+            .ToArray();
+
+        string[] meningioma = Directory.GetFiles(targetFolders[2], "*", SearchOption.AllDirectories)
+            .Where(IsSupportedImage)
+            .OrderBy(_ => random.Next())
+            .Take(34)
+            .ToArray();
+
+        // merge final dataset (100 images total)
+        string[] files = glioma
+            .Concat(pituitary)
+            .Concat(meningioma)
+            .ToArray();
+
+        Console.WriteLine($"Balanced dataset size: {files.Length}");
         Console.WriteLine($"Found {files.Length} images");
 
         // --------------------------------------------------

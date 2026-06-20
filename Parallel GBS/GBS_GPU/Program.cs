@@ -1,4 +1,9 @@
-﻿using System;
+﻿using BenchmarkDotNet.Attributes;
+using BenchmarkDotNet.Running;
+using ILGPU;
+using ILGPU.Runtime;
+using ILGPU.Runtime.Cuda;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -7,12 +12,10 @@ using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using ILGPU;
-using ILGPU.Runtime;
-using ILGPU.Runtime.Cuda;
 
 class Program
 {
+    // ================== CONFIGURATION ==================
     const string BaseFolderPath = @"C:\BrainTumorDataset\Testing\Testing";
     const string OutputFolderPath = @"C:\BrainTumorDataset\Testing\GraphSegmented";
 
@@ -20,19 +23,84 @@ class Program
     const int MinSize = 100;
     const int BlurRadius = 2;
 
-    static void Main()
+    // ================== BENCHMARK SETTINGS ==================
+    const bool RunBenchmarkDotNet = false;   // Set true to use BenchmarkDotNet
+    const string BenchmarkLabel = "GraphSeg"; // Label used in benchmark output
+
+    // ===================================================
+
+    static void Main(string[] args)
     {
+        bool runOnce = args.Contains("--run-once", StringComparer.OrdinalIgnoreCase);
+        bool runBenchmark = args.Contains("--benchmark", StringComparer.OrdinalIgnoreCase);
+
+        // BenchmarkDotNet mode
+        if ((RunBenchmarkDotNet && !runOnce) || args.Contains("--benchmark-dotnet", StringComparer.OrdinalIgnoreCase))
+        {
+            BenchmarkRunner.Run<GraphSegBenchmark>();
+            return;
+        }
+
+        // --------------------------------------------------
+        // BALANCED DATASET SAMPLING (100 images total)
+        // --------------------------------------------------
+        string inputFolder = Path.GetFullPath(BaseFolderPath);
         Directory.CreateDirectory(OutputFolderPath);
 
-        string[] files = Directory
-            .EnumerateFiles(BaseFolderPath, "*.*", SearchOption.AllDirectories)
+        string[] targetFolders = new[]
+        {
+            Path.Combine(inputFolder, "glioma"),
+            Path.Combine(inputFolder, "pituitary"),
+            Path.Combine(inputFolder, "meningioma")
+        };
+
+        var random = new Random(42); // fixed seed for reproducibility
+
+        // take per class (balanced)
+        string[] glioma = Directory.GetFiles(targetFolders[0], "*", SearchOption.AllDirectories)
             .Where(IsSupportedImage)
+            .OrderBy(_ => random.Next())
+            .Take(33)
             .ToArray();
 
+        string[] pituitary = Directory.GetFiles(targetFolders[1], "*", SearchOption.AllDirectories)
+            .Where(IsSupportedImage)
+            .OrderBy(_ => random.Next())
+            .Take(33)
+            .ToArray();
+
+        string[] meningioma = Directory.GetFiles(targetFolders[2], "*", SearchOption.AllDirectories)
+            .Where(IsSupportedImage)
+            .OrderBy(_ => random.Next())
+            .Take(34)
+            .ToArray();
+
+        // merge final dataset
+        string[] files = glioma
+            .Concat(pituitary)
+            .Concat(meningioma)
+            .ToArray();
+
+        Console.WriteLine($"Balanced dataset size: {files.Length}");
         Console.WriteLine($"Found {files.Length} images");
 
-        Stopwatch sw = Stopwatch.StartNew();
+        // Manual benchmark mode (sequential)
+        if (runBenchmark || args.Contains("--benchmark", StringComparer.OrdinalIgnoreCase))
+        {
+            RunManualBenchmark(files);
+            return;
+        }
 
+        // Normal parallel processing
+        RunNormalProcessing(files);
+    }
+
+    // ------------------------------------------------------------
+    //  NORMAL PARALLEL PROCESSING
+    // ------------------------------------------------------------
+    static void RunNormalProcessing(string[] files)
+    {
+        Stopwatch swTotal = Stopwatch.StartNew();
         int total = 0;
         object consoleLock = new();
 
@@ -47,10 +115,7 @@ class Program
                     using Bitmap rgb = ConvertTo24Bit(original);
 
                     float[] gray = ToGray(rgb);
-
-                    // GPU‑accelerated Gaussian blur
                     gray = GpuBlur.Apply(gray, rgb.Width, rgb.Height, BlurRadius);
-
                     int[] labels = GraphSegmentation(gray, rgb.Width, rgb.Height);
                     int tumorLabel = BestTumorComponent(labels, gray, rgb.Width, rgb.Height);
 
@@ -78,14 +143,157 @@ class Program
                 }
             });
 
-        sw.Stop();
+        swTotal.Stop();
 
         Console.WriteLine();
         Console.WriteLine("================================");
         Console.WriteLine($"Images : {total}");
-        Console.WriteLine($"Time   : {sw.Elapsed.TotalSeconds:F2}s");
-        Console.WriteLine($"Avg    : {sw.Elapsed.TotalMilliseconds / total:F2} ms");
+        Console.WriteLine($"Time   : {swTotal.Elapsed.TotalSeconds:F2}s");
+        Console.WriteLine($"Avg    : {swTotal.Elapsed.TotalMilliseconds / total:F2} ms");
         Console.WriteLine("================================");
+    }
+
+    // ------------------------------------------------------------
+    //  MANUAL BENCHMARK (SEQUENTIAL)
+    // ------------------------------------------------------------
+    static void RunManualBenchmark(string[] files)
+    {
+        if (files.Length == 0)
+            throw new InvalidOperationException("No input images found.");
+
+        Console.WriteLine($"Benchmark: {files.Length} images (sequential)");
+
+        var summary = new BenchmarkSummary();
+        var swTotal = Stopwatch.StartNew();
+
+        foreach (string file in files)
+        {
+            try
+            {
+                var result = ProcessOneImage(file);
+                summary.Add(result.Timing);
+                Console.WriteLine($"Processed: {Path.GetFileName(file)} -> {result.OutputPath}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error: {file} -> {ex.Message}");
+            }
+        }
+
+        swTotal.Stop();
+        PrintBenchmarkSummary(BenchmarkLabel, summary, swTotal.Elapsed.TotalMilliseconds);
+    }
+
+    // ------------------------------------------------------------
+    //  SINGLE IMAGE PROCESSING (USED BY BENCHMARK)
+    // ------------------------------------------------------------
+    static ImageRunResult ProcessOneImage(string file)
+    {
+        var swImage = Stopwatch.StartNew();
+
+        using Bitmap original = new Bitmap(file);
+        using Bitmap rgb = ConvertTo24Bit(original);
+
+        float[] gray = ToGray(rgb);
+
+        // GPU blur
+        gray = GpuBlur.Apply(gray, rgb.Width, rgb.Height, BlurRadius);
+
+        // Segmentation
+        int[] labels = GraphSegmentation(gray, rgb.Width, rgb.Height);
+        int tumorLabel = BestTumorComponent(labels, gray, rgb.Width, rgb.Height);
+
+        using Bitmap result = CreateGreenOverlay(rgb, labels, tumorLabel);
+
+        string outFile = Path.Combine(
+            OutputFolderPath,
+            Path.GetFileNameWithoutExtension(file) + "_graph.png");
+
+        result.Save(outFile, ImageFormat.Png);
+
+        swImage.Stop();
+
+        double processingTime = swImage.Elapsed.TotalMilliseconds; // pure algorithm time
+        // For a more accurate "image execution time" we include I/O and overhead,
+        // which is already included in swImage. We'll use the same value for both
+        // to keep it simple. If you want to separate, you could measure differently.
+
+        return new ImageRunResult(outFile, new FullBenchmarkTiming(processingTime, processingTime));
+    }
+
+    // ------------------------------------------------------------
+    //  BENCHMARK STATISTICS
+    // ------------------------------------------------------------
+    class BenchmarkSummary
+    {
+        public double TotalProcessingTimeMs { get; private set; }
+        public double TotalImageExecutionTimeMs { get; private set; }
+        public double MinProcessingTimeMs { get; private set; } = double.MaxValue;
+        public double MaxProcessingTimeMs { get; private set; }
+        public double MinImageExecutionTimeMs { get; private set; } = double.MaxValue;
+        public double MaxImageExecutionTimeMs { get; private set; }
+        public int Count { get; private set; }
+
+        public double AverageProcessingTimeMs => Count == 0 ? 0 : TotalProcessingTimeMs / Count;
+        public double AverageImageExecutionTimeMs => Count == 0 ? 0 : TotalImageExecutionTimeMs / Count;
+
+        public void Add(FullBenchmarkTiming timing)
+        {
+            Count++;
+            TotalProcessingTimeMs += timing.ProcessingTimeMs;
+            TotalImageExecutionTimeMs += timing.ImageExecutionTimeMs;
+            MinProcessingTimeMs = Math.Min(MinProcessingTimeMs, timing.ProcessingTimeMs);
+            MaxProcessingTimeMs = Math.Max(MaxProcessingTimeMs, timing.ProcessingTimeMs);
+            MinImageExecutionTimeMs = Math.Min(MinImageExecutionTimeMs, timing.ImageExecutionTimeMs);
+            MaxImageExecutionTimeMs = Math.Max(MaxImageExecutionTimeMs, timing.ImageExecutionTimeMs);
+        }
+    }
+
+    record struct FullBenchmarkTiming(double ProcessingTimeMs, double ImageExecutionTimeMs);
+    record struct ImageRunResult(string OutputPath, FullBenchmarkTiming Timing);
+
+    static void PrintBenchmarkSummary(string label, BenchmarkSummary summary, double executionTimeMs)
+    {
+        Console.WriteLine();
+        Console.WriteLine($"{label} benchmark:");
+        Console.WriteLine($"{label} overall processing time: {summary.TotalProcessingTimeMs:F2} ms");
+        Console.WriteLine($"{label} average processing time: {summary.AverageProcessingTimeMs:F2} ms");
+        Console.WriteLine($"{label} min processing time: {summary.MinProcessingTimeMs:F2} ms");
+        Console.WriteLine($"{label} max processing time: {summary.MaxProcessingTimeMs:F2} ms");
+        Console.WriteLine($"{label} overall execution time: {executionTimeMs:F2} ms");
+        Console.WriteLine($"{label} average execution time: {summary.AverageImageExecutionTimeMs:F2} ms");
+        Console.WriteLine($"{label} min execution time: {summary.MinImageExecutionTimeMs:F2} ms");
+        Console.WriteLine($"{label} max execution time: {summary.MaxImageExecutionTimeMs:F2} ms");
+    }
+
+    // ------------------------------------------------------------
+    //  BENCHMARKDOTNET WRAPPER
+    // ------------------------------------------------------------
+    public class GraphSegBenchmark
+    {
+        [Benchmark]
+        public void FullApplicationExecution()
+        {
+            string assemblyPath = typeof(GraphSegBenchmark).Assembly.Location;
+            ProcessStartInfo startInfo = new("dotnet")
+            {
+                ArgumentList = { assemblyPath, "--run-once" },
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+
+            using Process? process = Process.Start(startInfo);
+            if (process is null)
+                throw new InvalidOperationException("Failed to start benchmark process.");
+
+            string output = process.StandardOutput.ReadToEnd();
+            string error = process.StandardError.ReadToEnd();
+            process.WaitForExit();
+
+            if (process.ExitCode != 0)
+                throw new InvalidOperationException($"Benchmark failed: {error}\n{output}");
+        }
     }
 
     // ============================================================
@@ -157,7 +365,6 @@ class Program
             for (int k = -half; k <= half; k++)
             {
                 int xx = x + k;
-                // manual clamp
                 if (xx < 0) xx = 0;
                 if (xx >= width) xx = width - 1;
                 sum += input[y * width + xx] * kernel[k + half];
@@ -184,7 +391,6 @@ class Program
             for (int k = -half; k <= half; k++)
             {
                 int yy = y + k;
-                // manual clamp
                 if (yy < 0) yy = 0;
                 if (yy >= height) yy = height - 1;
                 sum += input[yy * width + x] * kernel[k + half];
