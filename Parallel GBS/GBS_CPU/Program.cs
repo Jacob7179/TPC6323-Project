@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -7,6 +8,8 @@ using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using BenchmarkDotNet.Attributes;
+using BenchmarkDotNet.Running;
 
 class Program
 {
@@ -17,8 +20,19 @@ class Program
     const int MinSize = 100;
     const int BlurRadius = 2;
 
-    static void Main()
+    static void Main(string[] args)
     {
+        // --------------------------------------------------
+        // Handle command‑line arguments for benchmarking
+        // --------------------------------------------------
+        if (args.Contains("--benchmark", StringComparer.OrdinalIgnoreCase))
+        {
+            BenchmarkRunner.Run<GraphSegmentationBenchmark>();
+            return;
+        }
+
+        bool runOnce = args.Contains("--run-once", StringComparer.OrdinalIgnoreCase);
+
         Directory.CreateDirectory(OutputFolderPath);
 
         string[] files = Directory
@@ -28,10 +42,13 @@ class Program
 
         Console.WriteLine($"Found {files.Length} images");
 
-        Stopwatch sw = Stopwatch.StartNew();
-
+        // --------------------------------------------------
+        // Timing collections
+        // --------------------------------------------------
+        Stopwatch swTotal = Stopwatch.StartNew();
         int total = 0;
         object consoleLock = new();
+        var allTimings = new ConcurrentBag<FullBenchmarkTiming>();
 
         Parallel.ForEach(
             files,
@@ -43,209 +60,153 @@ class Program
             {
                 try
                 {
+                    // ---------- Total image execution time (including I/O) ----------
+                    Stopwatch swImage = Stopwatch.StartNew();
+
                     using Bitmap original = new Bitmap(file);
                     using Bitmap rgb = ConvertTo24Bit(original);
 
+                    // ---------- Algorithm time (excluding I/O) ----------
+                    Stopwatch swAlgo = Stopwatch.StartNew();
+
                     float[] gray = ToGray(rgb);
-
-                    gray = GaussianBlur(
-                        gray,
-                        rgb.Width,
-                        rgb.Height,
-                        BlurRadius);
-
-                    int[] labels = GraphSegmentation(
-                        gray,
-                        rgb.Width,
-                        rgb.Height);
-
+                    gray = GaussianBlur(gray, rgb.Width, rgb.Height, BlurRadius);
+                    int[] labels = GraphSegmentation(gray, rgb.Width, rgb.Height);
                     int tumorLabel = BestTumorComponent(labels, gray, rgb.Width, rgb.Height);
 
-                    static int BestTumorComponent(int[] labels, float[] gray, int width, int height)
-                    {
-                        int n = labels.Length;
-                        var stats = new Dictionary<int, (int count, float sum, int minX, int maxX, int minY, int maxY)>();
+                    swAlgo.Stop();
 
-                        // First pass: collect basic stats and bounding box
-                        for (int i = 0; i < n; i++)
-                        {
-                            int l = labels[i];
-                            if (!stats.ContainsKey(l))
-                            {
-                                stats[l] = (0, 0f, width, -1, height, -1);
-                            }
-                            var (c, s, minX, maxX, minY, maxY) = stats[l];
-                            int x = i % width;
-                            int y = i / width;
-                            stats[l] = (c + 1, s + gray[i],
-                                        Math.Min(minX, x), Math.Max(maxX, x),
-                                        Math.Min(minY, y), Math.Max(maxY, y));
-                        }
+                    using Bitmap result = CreateGreenOverlay(rgb, labels, tumorLabel);
 
-                        // Helper: does component touch border?
-                        bool TouchesBorder(int label)
-                        {
-                            var (_, _, minX, maxX, minY, maxY) = stats[label];
-                            return minX == 0 || maxX == width - 1 || minY == 0 || maxY == height - 1;
-                        }
-
-                        // 1. Find brain component: largest component that does NOT touch border
-                        //    and has mean intensity between 0.2 and 0.8 (typical brain range)
-                        int brainLabel = -1;
-                        int maxBrainSize = 0;
-                        foreach (var kv in stats)
-                        {
-                            int label = kv.Key;
-                            var (count, sum, _, _, _, _) = kv.Value;
-                            float mean = sum / count;
-                            if (!TouchesBorder(label) && mean > 0.2f && mean < 0.8f)
-                            {
-                                if (count > maxBrainSize)
-                                {
-                                    maxBrainSize = count;
-                                    brainLabel = label;
-                                }
-                            }
-                        }
-
-                        // If no clear brain found, fallback to simple scoring (no brain mask)
-                        bool hasBrain = brainLabel != -1;
-
-                        // 2. Compute global mean for intensity scoring
-                        float globalMean = 0f;
-                        foreach (var v in stats.Values) globalMean += v.sum;
-                        globalMean /= n;
-
-                        // 3. Score each component (tumor candidates)
-                        var scores = new List<(int label, float score)>();
-
-                        foreach (var kv in stats)
-                        {
-                            int label = kv.Key;
-                            var (count, sum, minX, maxX, minY, maxY) = kv.Value;
-
-                            // Skip if we have a brain and this component is the brain itself
-                            if (hasBrain && label == brainLabel) continue;
-
-                            // Tumor must be inside brain: if brain exists, candidate must NOT touch border
-                            // and its centroid must lie inside brain's bounding box (quick filter)
-                            if (hasBrain)
-                            {
-                                if (TouchesBorder(label)) continue;
-
-                                // Compute centroid
-                                int cx = 0, cy = 0;
-                                for (int i = 0; i < n; i++)
-                                    if (labels[i] == label)
-                                    {
-                                        int x = i % width;
-                                        int y = i / width;
-                                        cx += x;
-                                        cy += y;
-                                    }
-                                cx /= count;
-                                cy /= count;
-
-                                var (_, _, bMinX, bMaxX, bMinY, bMaxY) = stats[brainLabel];
-                                if (cx < bMinX || cx > bMaxX || cy < bMinY || cy > bMaxY)
-                                    continue;
-                            }
-                            else
-                            {
-                                // No brain found – still penalize border-touching components heavily
-                                if (TouchesBorder(label)) continue;
-                            }
-
-                            float mean = sum / count;
-
-                            // Intensity score: higher than global mean gets bonus
-                            float intensityScore = mean - globalMean;
-                            if (intensityScore < 0) intensityScore *= 0.2f;
-
-                            // Size score (log scale)
-                            float sizeScore = MathF.Log(count + 1) * 0.5f;
-
-                            // Approximate circularity (simplified, as before)
-                            float perimeter = 0f;
-                            int ww = maxX - minX + 1;
-                            int hh = maxY - minY + 1;
-                            bool[,] mask = new bool[ww, hh];
-                            for (int y = minY; y <= maxY; y++)
-                                for (int x = minX; x <= maxX; x++)
-                                    if (labels[y * width + x] == label)
-                                        mask[x - minX, y - minY] = true;
-
-                            for (int y = 0; y < hh; y++)
-                                for (int x = 0; x < ww; x++)
-                                    if (mask[x, y])
-                                    {
-                                        if (x == 0 || !mask[x - 1, y]) perimeter++;
-                                        if (x == ww - 1 || !mask[x + 1, y]) perimeter++;
-                                        if (y == 0 || !mask[x, y - 1]) perimeter++;
-                                        if (y == hh - 1 || !mask[x, y + 1]) perimeter++;
-                                    }
-                            float circularity = (4 * MathF.PI * count) / (perimeter * perimeter + 1e-6f);
-                            float shapeScore = MathF.Min(circularity, 1.0f);
-
-                            // Final score – border non‑touching already enforced, so no extra penalty
-                            float finalScore = intensityScore * 1.2f + sizeScore * 0.3f + shapeScore * 0.5f;
-
-                            scores.Add((label, finalScore));
-                        }
-
-                        // If no valid candidate found, fallback to the largest component (old behavior)
-                        if (scores.Count == 0)
-                        {
-                            return stats.OrderByDescending(kv => kv.Value.count).First().Key;
-                        }
-
-                        return scores.OrderByDescending(s => s.score).First().label;
-                    }
-
-                    using Bitmap result =
-                        CreateGreenOverlay(
-                            rgb,
-                            labels,
-                            tumorLabel);
-
-                    string outFile =
-                        Path.Combine(
-                            OutputFolderPath,
-                            Path.GetFileNameWithoutExtension(file)
-                            + "_graph.png");
-
+                    string outFile = Path.Combine(
+                        OutputFolderPath,
+                        Path.GetFileNameWithoutExtension(file) + "_graph.png");
                     result.Save(outFile, ImageFormat.Png);
+
+                    swImage.Stop();
+
+                    allTimings.Add(new FullBenchmarkTiming(
+                        swAlgo.Elapsed.TotalMilliseconds,
+                        swImage.Elapsed.TotalMilliseconds));
 
                     Interlocked.Increment(ref total);
 
                     lock (consoleLock)
                     {
-                        Console.WriteLine(
-                            $"Processed: {Path.GetFileName(file)}");
+                        Console.WriteLine($"Processed: {Path.GetFileName(file)}");
                     }
                 }
                 catch (Exception ex)
                 {
                     lock (consoleLock)
                     {
-                        Console.WriteLine(
-                            $"Error: {file} -> {ex.Message}");
+                        Console.WriteLine($"Error: {file} -> {ex.Message}");
                     }
                 }
             });
 
-        sw.Stop();
+        swTotal.Stop();
 
         Console.WriteLine();
         Console.WriteLine("================================");
         Console.WriteLine($"Images : {total}");
-        Console.WriteLine($"Time   : {sw.Elapsed.TotalSeconds:F2}s");
-        Console.WriteLine($"Avg    : {sw.Elapsed.TotalMilliseconds / total:F2} ms");
+        Console.WriteLine($"Time   : {swTotal.Elapsed.TotalSeconds:F2}s");
+        Console.WriteLine($"Avg    : {swTotal.Elapsed.TotalMilliseconds / total:F2} ms");
         Console.WriteLine("================================");
+
+        // --------------------------------------------------
+        // Print detailed benchmark summary (unless runOnce)
+        // --------------------------------------------------
+        if (!runOnce && allTimings.Any())
+        {
+            var summary = new BenchmarkSummary();
+            foreach (var t in allTimings)
+                summary.Add(t);
+            PrintBenchmark("CPU Graph Segmentation", summary, swTotal.Elapsed.TotalMilliseconds);
+        }
     }
 
     // --------------------------------------------------
-    // GRAPH SEGMENTATION
+    // BENCHMARKING INFRASTRUCTURE
+    // --------------------------------------------------
+
+    public class GraphSegmentationBenchmark
+    {
+        [Benchmark]
+        public void FullApplicationExecution()
+        {
+            BenchmarkProcessRunner.RunCurrentAssembly();
+        }
+    }
+
+    static class BenchmarkProcessRunner
+    {
+        public static void RunCurrentAssembly()
+        {
+            string assemblyPath = typeof(BenchmarkProcessRunner).Assembly.Location;
+            ProcessStartInfo startInfo = new("dotnet")
+            {
+                ArgumentList = { assemblyPath, "--run-once" },
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+
+            using Process? process = Process.Start(startInfo);
+            if (process is null)
+                throw new InvalidOperationException("Failed to start benchmark process.");
+
+            string output = process.StandardOutput.ReadToEnd();
+            string error = process.StandardError.ReadToEnd();
+            process.WaitForExit();
+
+            if (process.ExitCode != 0)
+                throw new InvalidOperationException("Benchmark process failed: " + error + output);
+        }
+    }
+
+    public record struct FullBenchmarkTiming(double ProcessingTimeMs, double ImageExecutionTimeMs);
+
+    public class BenchmarkSummary
+    {
+        public double TotalProcessingTimeMs { get; private set; }
+        public double TotalImageExecutionTimeMs { get; private set; }
+        public double MinProcessingTimeMs { get; private set; } = double.MaxValue;
+        public double MaxProcessingTimeMs { get; private set; }
+        public double MinImageExecutionTimeMs { get; private set; } = double.MaxValue;
+        public double MaxImageExecutionTimeMs { get; private set; }
+        public int Count { get; private set; }
+
+        public double AverageProcessingTimeMs => Count == 0 ? 0 : TotalProcessingTimeMs / Count;
+        public double AverageImageExecutionTimeMs => Count == 0 ? 0 : TotalImageExecutionTimeMs / Count;
+
+        public void Add(FullBenchmarkTiming timing)
+        {
+            Count++;
+            TotalProcessingTimeMs += timing.ProcessingTimeMs;
+            TotalImageExecutionTimeMs += timing.ImageExecutionTimeMs;
+            MinProcessingTimeMs = Math.Min(MinProcessingTimeMs, timing.ProcessingTimeMs);
+            MaxProcessingTimeMs = Math.Max(MaxProcessingTimeMs, timing.ProcessingTimeMs);
+            MinImageExecutionTimeMs = Math.Min(MinImageExecutionTimeMs, timing.ImageExecutionTimeMs);
+            MaxImageExecutionTimeMs = Math.Max(MaxImageExecutionTimeMs, timing.ImageExecutionTimeMs);
+        }
+    }
+
+    static void PrintBenchmark(string label, BenchmarkSummary summary, double executionTimeMs)
+    {
+        Console.WriteLine($"{label} benchmark:");
+        Console.WriteLine($"{label} overall processing time: {summary.TotalProcessingTimeMs:F2} ms");
+        Console.WriteLine($"{label} average processing time: {summary.AverageProcessingTimeMs:F2} ms");
+        Console.WriteLine($"{label} min processing time: {summary.MinProcessingTimeMs:F2} ms");
+        Console.WriteLine($"{label} max processing time: {summary.MaxProcessingTimeMs:F2} ms");
+        Console.WriteLine($"{label} overall execution time: {executionTimeMs:F2} ms");
+        Console.WriteLine($"{label} average execution time: {summary.AverageImageExecutionTimeMs:F2} ms");
+        Console.WriteLine($"{label} min execution time: {summary.MinImageExecutionTimeMs:F2} ms");
+        Console.WriteLine($"{label} max execution time: {summary.MaxImageExecutionTimeMs:F2} ms");
+    }
+
+    // --------------------------------------------------
+    // GRAPH SEGMENTATION (unchanged from original)
     // --------------------------------------------------
 
     struct Edge
@@ -255,25 +216,15 @@ class Program
         public float Weight;
     }
 
-    static int[] GraphSegmentation(
-        float[] image,
-        int width,
-        int height)
+    static int[] GraphSegmentation(float[] image, int width, int height)
     {
         int n = width * height;
 
-        List<Edge> edges = BuildGraph(
-            image,
-            width,
-            height);
-
-        edges.Sort((a, b) =>
-            a.Weight.CompareTo(b.Weight));
+        List<Edge> edges = BuildGraph(image, width, height);
+        edges.Sort((a, b) => a.Weight.CompareTo(b.Weight));
 
         DisjointSet ds = new DisjointSet(n);
-
         float[] threshold = new float[n];
-
         for (int i = 0; i < n; i++)
             threshold[i] = K;
 
@@ -281,20 +232,13 @@ class Program
         {
             int a = ds.Find(e.A);
             int b = ds.Find(e.B);
-
             if (a == b)
                 continue;
-
-            if (e.Weight <= threshold[a]
-                && e.Weight <= threshold[b])
+            if (e.Weight <= threshold[a] && e.Weight <= threshold[b])
             {
                 ds.Union(a, b);
-
                 int root = ds.Find(a);
-
-                threshold[root] =
-                    e.Weight +
-                    K / ds.Size(root);
+                threshold[root] = e.Weight + K / ds.Size(root);
             }
         }
 
@@ -302,89 +246,41 @@ class Program
         {
             int a = ds.Find(e.A);
             int b = ds.Find(e.B);
-
             if (a == b)
                 continue;
-
-            if (ds.Size(a) < MinSize
-                || ds.Size(b) < MinSize)
-            {
+            if (ds.Size(a) < MinSize || ds.Size(b) < MinSize)
                 ds.Union(a, b);
-            }
         }
 
         int[] labels = new int[n];
-
         for (int i = 0; i < n; i++)
             labels[i] = ds.Find(i);
 
         return labels;
     }
 
-    static List<Edge> BuildGraph(
-        float[] image,
-        int width,
-        int height)
+    static List<Edge> BuildGraph(float[] image, int width, int height)
     {
         List<Edge> edges = new();
 
         for (int y = 0; y < height; y++)
         {
             int row = y * width;
-
             for (int x = 0; x < width; x++)
             {
                 int p = row + x;
 
                 if (x < width - 1)
-                {
-                    edges.Add(new Edge
-                    {
-                        A = p,
-                        B = p + 1,
-                        Weight = MathF.Abs(
-                            image[p]
-                            - image[p + 1])
-                    });
-                }
+                    edges.Add(new Edge { A = p, B = p + 1, Weight = MathF.Abs(image[p] - image[p + 1]) });
 
                 if (y < height - 1)
-                {
-                    edges.Add(new Edge
-                    {
-                        A = p,
-                        B = p + width,
-                        Weight = MathF.Abs(
-                            image[p]
-                            - image[p + width])
-                    });
-                }
+                    edges.Add(new Edge { A = p, B = p + width, Weight = MathF.Abs(image[p] - image[p + width]) });
 
-                if (x < width - 1 &&
-                    y < height - 1)
-                {
-                    edges.Add(new Edge
-                    {
-                        A = p,
-                        B = p + width + 1,
-                        Weight = MathF.Abs(
-                            image[p]
-                            - image[p + width + 1])
-                    });
-                }
+                if (x < width - 1 && y < height - 1)
+                    edges.Add(new Edge { A = p, B = p + width + 1, Weight = MathF.Abs(image[p] - image[p + width + 1]) });
 
-                if (x < width - 1 &&
-                    y > 0)
-                {
-                    edges.Add(new Edge
-                    {
-                        A = p,
-                        B = p - width + 1,
-                        Weight = MathF.Abs(
-                            image[p]
-                            - image[p - width + 1])
-                    });
-                }
+                if (x < width - 1 && y > 0)
+                    edges.Add(new Edge { A = p, B = p - width + 1, Weight = MathF.Abs(image[p] - image[p - width + 1]) });
             }
         }
 
@@ -404,7 +300,6 @@ class Program
         {
             parent = new int[n];
             size = new int[n];
-
             for (int i = 0; i < n; i++)
             {
                 parent[i] = i;
@@ -416,7 +311,6 @@ class Program
         {
             if (parent[x] == x)
                 return x;
-
             parent[x] = Find(parent[x]);
             return parent[x];
         }
@@ -425,47 +319,140 @@ class Program
         {
             a = Find(a);
             b = Find(b);
-
             if (a == b)
                 return;
-
             if (size[a] < size[b])
             {
                 int t = a;
                 a = b;
                 b = t;
             }
-
             parent[b] = a;
             size[a] += size[b];
         }
 
-        public int Size(int x)
-        {
-            return size[Find(x)];
-        }
+        public int Size(int x) => size[Find(x)];
     }
 
     // --------------------------------------------------
-    // TUMOR REGION
+    // TUMOR COMPONENT SELECTION
     // --------------------------------------------------
 
-    static int LargestComponent(int[] labels)
+    static int BestTumorComponent(int[] labels, float[] gray, int width, int height)
     {
-        Dictionary<int, int> counts = new();
+        int n = labels.Length;
+        var stats = new Dictionary<int, (int count, float sum, int minX, int maxX, int minY, int maxY)>();
 
-        foreach (int l in labels)
+        for (int i = 0; i < n; i++)
         {
-            if (!counts.ContainsKey(l))
-                counts[l] = 0;
-
-            counts[l]++;
+            int l = labels[i];
+            if (!stats.ContainsKey(l))
+                stats[l] = (0, 0f, width, -1, height, -1);
+            var (c, s, minX, maxX, minY, maxY) = stats[l];
+            int x = i % width;
+            int y = i / width;
+            stats[l] = (c + 1, s + gray[i],
+                        Math.Min(minX, x), Math.Max(maxX, x),
+                        Math.Min(minY, y), Math.Max(maxY, y));
         }
 
-        return counts
-            .OrderByDescending(x => x.Value)
-            .First()
-            .Key;
+        bool TouchesBorder(int label)
+        {
+            var (_, _, minX, maxX, minY, maxY) = stats[label];
+            return minX == 0 || maxX == width - 1 || minY == 0 || maxY == height - 1;
+        }
+
+        int brainLabel = -1;
+        int maxBrainSize = 0;
+        foreach (var kv in stats)
+        {
+            int label = kv.Key;
+            var (count, sum, _, _, _, _) = kv.Value;
+            float mean = sum / count;
+            if (!TouchesBorder(label) && mean > 0.2f && mean < 0.8f)
+            {
+                if (count > maxBrainSize)
+                {
+                    maxBrainSize = count;
+                    brainLabel = label;
+                }
+            }
+        }
+
+        bool hasBrain = brainLabel != -1;
+
+        float globalMean = 0f;
+        foreach (var v in stats.Values) globalMean += v.sum;
+        globalMean /= n;
+
+        var scores = new List<(int label, float score)>();
+
+        foreach (var kv in stats)
+        {
+            int label = kv.Key;
+            var (count, sum, minX, maxX, minY, maxY) = kv.Value;
+
+            if (hasBrain && label == brainLabel) continue;
+
+            if (hasBrain)
+            {
+                if (TouchesBorder(label)) continue;
+                int cx = 0, cy = 0;
+                for (int i = 0; i < n; i++)
+                    if (labels[i] == label)
+                    {
+                        int x = i % width;
+                        int y = i / width;
+                        cx += x;
+                        cy += y;
+                    }
+                cx /= count;
+                cy /= count;
+
+                var (_, _, bMinX, bMaxX, bMinY, bMaxY) = stats[brainLabel];
+                if (cx < bMinX || cx > bMaxX || cy < bMinY || cy > bMaxY)
+                    continue;
+            }
+            else
+            {
+                if (TouchesBorder(label)) continue;
+            }
+
+            float mean = sum / count;
+
+            float intensityScore = mean - globalMean;
+            if (intensityScore < 0) intensityScore *= 0.2f;
+            float sizeScore = MathF.Log(count + 1) * 0.5f;
+
+            float perimeter = 0f;
+            int ww = maxX - minX + 1;
+            int hh = maxY - minY + 1;
+            bool[,] mask = new bool[ww, hh];
+            for (int y = minY; y <= maxY; y++)
+                for (int x = minX; x <= maxX; x++)
+                    if (labels[y * width + x] == label)
+                        mask[x - minX, y - minY] = true;
+
+            for (int y = 0; y < hh; y++)
+                for (int x = 0; x < ww; x++)
+                    if (mask[x, y])
+                    {
+                        if (x == 0 || !mask[x - 1, y]) perimeter++;
+                        if (x == ww - 1 || !mask[x + 1, y]) perimeter++;
+                        if (y == 0 || !mask[x, y - 1]) perimeter++;
+                        if (y == hh - 1 || !mask[x, y + 1]) perimeter++;
+                    }
+            float circularity = (4 * MathF.PI * count) / (perimeter * perimeter + 1e-6f);
+            float shapeScore = MathF.Min(circularity, 1.0f);
+
+            float finalScore = intensityScore * 1.2f + sizeScore * 0.3f + shapeScore * 0.5f;
+            scores.Add((label, finalScore));
+        }
+
+        if (scores.Count == 0)
+            return stats.OrderByDescending(kv => kv.Value.count).First().Key;
+
+        return scores.OrderByDescending(s => s.score).First().label;
     }
 
     // --------------------------------------------------
@@ -474,28 +461,15 @@ class Program
 
     static bool IsSupportedImage(string path)
     {
-        string ext =
-            Path.GetExtension(path).ToLower();
-
-        return ext == ".jpg"
-            || ext == ".jpeg"
-            || ext == ".png"
-            || ext == ".bmp";
+        string ext = Path.GetExtension(path).ToLower();
+        return ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".bmp";
     }
 
     static Bitmap ConvertTo24Bit(Bitmap src)
     {
-        Bitmap bmp =
-            new Bitmap(
-                src.Width,
-                src.Height,
-                PixelFormat.Format24bppRgb);
-
-        using Graphics g =
-            Graphics.FromImage(bmp);
-
+        Bitmap bmp = new Bitmap(src.Width, src.Height, PixelFormat.Format24bppRgb);
+        using Graphics g = Graphics.FromImage(bmp);
         g.DrawImage(src, 0, 0);
-
         return bmp;
     }
 
@@ -503,60 +477,37 @@ class Program
     {
         int w = bmp.Width;
         int h = bmp.Height;
-
         float[] gray = new float[w * h];
 
-        BitmapData data =
-            bmp.LockBits(
-                new Rectangle(0, 0, w, h),
-                ImageLockMode.ReadOnly,
-                PixelFormat.Format24bppRgb);
-
+        BitmapData data = bmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
         byte* ptr = (byte*)data.Scan0;
 
         for (int y = 0; y < h; y++)
         {
             byte* row = ptr + y * data.Stride;
-
             for (int x = 0; x < w; x++)
             {
                 int p = x * 3;
-
-                gray[y * w + x] =
-                    0.299f * row[p + 2]
-                    + 0.587f * row[p + 1]
-                    + 0.114f * row[p];
+                gray[y * w + x] = 0.299f * row[p + 2] + 0.587f * row[p + 1] + 0.114f * row[p];
             }
         }
 
         bmp.UnlockBits(data);
-
         return gray;
     }
 
-    static float[] GaussianBlur(
-        float[] input,
-        int w,
-        int h,
-        int r)
+    static float[] GaussianBlur(float[] input, int w, int h, int r)
     {
         float[] temp = new float[input.Length];
         float[] output = new float[input.Length];
 
         float sigma = r / 2f;
-
-        float[] kernel =
-            new float[r * 2 + 1];
-
+        float[] kernel = new float[r * 2 + 1];
         float sum = 0;
 
         for (int i = -r; i <= r; i++)
         {
-            float v =
-                MathF.Exp(
-                    -(i * i)
-                    / (2 * sigma * sigma));
-
+            float v = MathF.Exp(-(i * i) / (2 * sigma * sigma));
             kernel[i + r] = v;
             sum += v;
         }
@@ -567,23 +518,14 @@ class Program
         for (int y = 0; y < h; y++)
         {
             int row = y * w;
-
             for (int x = 0; x < w; x++)
             {
                 float s = 0;
-
                 for (int k = -r; k <= r; k++)
                 {
-                    int xx =
-                        Math.Clamp(
-                            x + k,
-                            0,
-                            w - 1);
-
-                    s += input[row + xx]
-                         * kernel[k + r];
+                    int xx = Math.Clamp(x + k, 0, w - 1);
+                    s += input[row + xx] * kernel[k + r];
                 }
-
                 temp[row + x] = s;
             }
         }
@@ -593,19 +535,11 @@ class Program
             for (int x = 0; x < w; x++)
             {
                 float s = 0;
-
                 for (int k = -r; k <= r; k++)
                 {
-                    int yy =
-                        Math.Clamp(
-                            y + k,
-                            0,
-                            h - 1);
-
-                    s += temp[yy * w + x]
-                         * kernel[k + r];
+                    int yy = Math.Clamp(y + k, 0, h - 1);
+                    s += temp[yy * w + x] * kernel[k + r];
                 }
-
                 output[y * w + x] = s;
             }
         }
@@ -613,31 +547,15 @@ class Program
         return output;
     }
 
-    static unsafe Bitmap CreateGreenOverlay(
-        Bitmap original,
-        int[] labels,
-        int tumorLabel)
+    static unsafe Bitmap CreateGreenOverlay(Bitmap original, int[] labels, int tumorLabel)
     {
         int w = original.Width;
         int h = original.Height;
 
-        Bitmap result =
-            new Bitmap(
-                w,
-                h,
-                PixelFormat.Format24bppRgb);
+        Bitmap result = new Bitmap(w, h, PixelFormat.Format24bppRgb);
 
-        BitmapData src =
-            original.LockBits(
-                new Rectangle(0, 0, w, h),
-                ImageLockMode.ReadOnly,
-                PixelFormat.Format24bppRgb);
-
-        BitmapData dst =
-            result.LockBits(
-                new Rectangle(0, 0, w, h),
-                ImageLockMode.WriteOnly,
-                PixelFormat.Format24bppRgb);
+        BitmapData src = original.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
+        BitmapData dst = result.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.WriteOnly, PixelFormat.Format24bppRgb);
 
         byte* sp = (byte*)src.Scan0;
         byte* dp = (byte*)dst.Scan0;
@@ -660,12 +578,7 @@ class Program
                 }
                 else
                 {
-                    byte g =
-                        (byte)(
-                            0.299f * srow[p + 2]
-                            + 0.587f * srow[p + 1]
-                            + 0.114f * srow[p]);
-
+                    byte g = (byte)(0.299f * srow[p + 2] + 0.587f * srow[p + 1] + 0.114f * srow[p]);
                     drow[p] = g;
                     drow[p + 1] = g;
                     drow[p + 2] = g;
