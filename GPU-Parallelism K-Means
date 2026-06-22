@@ -1,0 +1,368 @@
+// CPU-Parallelism K-Means
+
+using System;
+using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+
+class Program
+{
+    const string BaseFolderPath = @"C:\Users\user\Downloads\Brain MRI\Training";
+    const string OutputFolderPath = @"C:\Users\user\Downloads\Segmented Output";
+
+    const int K = 3;
+    const int BlurRadius = 2;
+    const int MaxIterations = 20;
+
+    static void Main()
+    {
+        string inputFolder = Path.GetFullPath(BaseFolderPath);
+        if (!Directory.Exists(inputFolder))
+            throw new DirectoryNotFoundException(inputFolder);
+
+        Directory.CreateDirectory(OutputFolderPath);
+
+        string[] targetFolders =
+        {
+            Path.Combine(inputFolder, "glioma"),
+            Path.Combine(inputFolder, "pituitary"),
+            Path.Combine(inputFolder, "meningioma")
+        };
+
+var random = new Random(42);
+
+// per-class balanced sampling
+string[] glioma = Directory.GetFiles(targetFolders[0], "*.*", SearchOption.AllDirectories)
+    .Where(IsSupportedImage)
+    .OrderBy(_ => random.Next())
+    .Take(33)
+    .ToArray();
+
+string[] pituitary = Directory.GetFiles(targetFolders[1], "*.*", SearchOption.AllDirectories)
+    .Where(IsSupportedImage)
+    .OrderBy(_ => random.Next())
+    .Take(33)
+    .ToArray();
+
+string[] meningioma = Directory.GetFiles(targetFolders[2], "*.*", SearchOption.AllDirectories)
+    .Where(IsSupportedImage)
+    .OrderBy(_ => random.Next())
+    .Take(34)
+    .ToArray();
+
+// merge final dataset (100 images total)
+string[] files = glioma
+    .Concat(pituitary)
+    .Concat(meningioma)
+    .ToArray();
+
+Console.WriteLine($"Balanced dataset size: {files.Length} (33 glioma, 33 pituitary, 34 meningioma)");
+
+        Console.WriteLine($"Found {files.Length} images");
+
+        int totalImages = 0;
+        object consoleLock = new();
+        Stopwatch sw = Stopwatch.StartNew();
+
+        Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = 4 }, file =>
+        {
+            try
+            {
+                using Bitmap original = new Bitmap(file);
+                using Bitmap rgb = ConvertTo24Bit(original);
+
+                float[] gray = GetGrayBytes(rgb);
+                gray = GaussianBlurCPU(gray, rgb.Width, rgb.Height, BlurRadius);
+
+                var (labels, centroids) = KMeansCPU(gray, rgb.Width, rgb.Height, K);
+
+                int tumorCluster = FindTumorCluster(labels, centroids, rgb.Width, rgb.Height);
+
+                using Bitmap overlay = CreateGreenOverlayFast(rgb, labels, tumorCluster);
+
+                string outputPath = Path.Combine(
+                    OutputFolderPath,
+                    Path.GetFileNameWithoutExtension(file) + "_tumor.png"
+                );
+
+                overlay.Save(outputPath, ImageFormat.Png);
+
+                Interlocked.Increment(ref totalImages);
+                lock (consoleLock)
+                    Console.WriteLine($"Processed: {Path.GetFileName(file)}");
+            }
+            catch (Exception ex)
+            {
+                lock (consoleLock)
+                {
+                    Console.WriteLine($"Error: {Path.GetFileName(file)}");
+                    Console.WriteLine(ex.Message);
+                }
+            }
+        });
+
+        sw.Stop();
+
+        Console.WriteLine();
+        Console.WriteLine("=================================");
+        Console.WriteLine($"Total images : {totalImages}");
+        Console.WriteLine($"Total time   : {sw.Elapsed.TotalSeconds:F2} sec");
+        if (totalImages > 0)
+            Console.WriteLine($"Avg/image    : {sw.Elapsed.TotalMilliseconds / totalImages:F2} ms");
+        Console.WriteLine("=================================");
+    }
+
+    // =====================================================
+    // CPU K-MEANS
+    // =====================================================
+    static (int[] labels, float[] centroids) KMeansCPU(float[] pixels, int width, int height, int k)
+    {
+        int n = width * height;
+
+        float[] centroids = { 40f, 120f, 220f };
+        int[] labels = new int[n];
+
+        float[] sums = new float[k];
+        int[] counts = new int[k];
+
+        for (int iter = 0; iter < MaxIterations; iter++)
+        {
+            // reset
+            Array.Clear(sums, 0, k);
+            Array.Clear(counts, 0, k);
+
+            object lockObj = new();
+
+            Parallel.For(0, n,
+                () => (localSums: new float[k], localCounts: new int[k]),
+                (i, state, local) =>
+                {
+                    float pix = pixels[i];
+
+                    int best = 0;
+                    float bestDist = float.MaxValue;
+
+                    for (int c = 0; c < k; c++)
+                    {
+                        float d = pix - centroids[c];
+                        d *= d;
+
+                        if (d < bestDist)
+                        {
+                            bestDist = d;
+                            best = c;
+                        }
+                    }
+
+                    labels[i] = best;
+
+                    local.localSums[best] += pix;
+                    local.localCounts[best]++;
+
+                    return local;
+                },
+                local =>
+                {
+                    lock (lockObj)
+                    {
+                        for (int c = 0; c < k; c++)
+                        {
+                            sums[c] += local.localSums[c];
+                            counts[c] += local.localCounts[c];
+                        }
+                    }
+                });
+
+            for (int c = 0; c < k; c++)
+            {
+                if (counts[c] > 0)
+                    centroids[c] = sums[c] / counts[c];
+            }
+        }
+
+        return (labels, centroids);
+    }
+
+    // =====================================================
+    // PREPROCESSING
+    // =====================================================
+    static float[] GetGrayBytes(Bitmap bmp)
+    {
+        int w = bmp.Width, h = bmp.Height;
+        float[] gray = new float[w * h];
+
+        BitmapData bmpData = bmp.LockBits(
+            new Rectangle(0, 0, w, h),
+            ImageLockMode.ReadOnly,
+            PixelFormat.Format24bppRgb);
+
+        unsafe
+        {
+            byte* ptr = (byte*)bmpData.Scan0;
+
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++)
+                {
+                    int p = y * bmpData.Stride + x * 3;
+                    byte b = ptr[p], g = ptr[p + 1], r = ptr[p + 2];
+                    gray[y * w + x] = 0.299f * r + 0.587f * g + 0.114f * b;
+                }
+        }
+
+        bmp.UnlockBits(bmpData);
+        return gray;
+    }
+
+    static float[] GaussianBlurCPU(float[] img, int w, int h, int r)
+    {
+        if (r == 0) return img;
+
+        float sigma = r / 2f;
+        float twoSigma2 = 2 * sigma * sigma;
+
+        float[] kernel = new float[r * 2 + 1];
+        for (int i = -r; i <= r; i++)
+            kernel[i + r] = MathF.Exp(-(i * i) / twoSigma2);
+
+        float sumK = kernel.Sum();
+        for (int i = 0; i < kernel.Length; i++)
+            kernel[i] /= sumK;
+
+        float[] tmp = new float[w * h];
+        float[] res = new float[w * h];
+
+        Parallel.For(0, h, y =>
+        {
+            for (int x = 0; x < w; x++)
+            {
+                float s = 0;
+
+                for (int k = -r; k <= r; k++)
+                {
+                    int xx = Math.Clamp(x + k, 0, w - 1);
+                    s += img[y * w + xx] * kernel[k + r];
+                }
+
+                tmp[y * w + x] = s;
+            }
+        });
+
+        Parallel.For(0, h, y =>
+        {
+            for (int x = 0; x < w; x++)
+            {
+                float s = 0;
+
+                for (int k = -r; k <= r; k++)
+                {
+                    int yy = Math.Clamp(y + k, 0, h - 1);
+                    s += tmp[yy * w + x] * kernel[k + r];
+                }
+
+                res[y * w + x] = s;
+            }
+        });
+
+        return res;
+    }
+
+    // =====================================================
+    // UTILITIES (unchanged)
+    // =====================================================
+    static bool IsSupportedImage(string path)
+    {
+        string ext = Path.GetExtension(path).ToLowerInvariant();
+        return ext is ".jpg" or ".jpeg" or ".png" or ".bmp";
+    }
+
+    static Bitmap ConvertTo24Bit(Bitmap src)
+    {
+        Bitmap bmp = new(src.Width, src.Height, PixelFormat.Format24bppRgb);
+        using Graphics g = Graphics.FromImage(bmp);
+        g.DrawImage(src, 0, 0);
+        return bmp;
+    }
+
+    static int FindTumorCluster(int[] labels, float[] centroids, int w, int h)
+    {
+        int k = centroids.Length;
+        int[] counts = new int[k];
+
+        foreach (int l in labels)
+            counts[l]++;
+
+        int best = 0;
+        float bestScore = float.MinValue;
+
+        for (int c = 0; c < k; c++)
+        {
+            float brightness = centroids[c];
+            float sizePenalty = counts[c] / (float)(w * h);
+            float score = brightness - sizePenalty * 120f;
+
+            if (score > bestScore)
+            {
+                bestScore = score;
+                best = c;
+            }
+        }
+
+        return best;
+    }
+
+    static unsafe Bitmap CreateGreenOverlayFast(Bitmap original, int[] labels, int tumorCluster)
+    {
+        int w = original.Width, h = original.Height;
+        Bitmap result = new(w, h, PixelFormat.Format24bppRgb);
+
+        BitmapData src = original.LockBits(
+            new Rectangle(0, 0, w, h),
+            ImageLockMode.ReadOnly,
+            PixelFormat.Format24bppRgb);
+
+        BitmapData dst = result.LockBits(
+            new Rectangle(0, 0, w, h),
+            ImageLockMode.WriteOnly,
+            PixelFormat.Format24bppRgb);
+
+        byte* sp = (byte*)src.Scan0;
+        byte* dp = (byte*)dst.Scan0;
+
+        Parallel.For(0, h, y =>
+        {
+            byte* srow = sp + y * src.Stride;
+            byte* drow = dp + y * dst.Stride;
+            int baseIdx = y * w;
+
+            for (int x = 0; x < w; x++)
+            {
+                int i = baseIdx + x;
+                int p = x * 3;
+
+                byte b = srow[p], g = srow[p + 1], r = srow[p + 2];
+                byte gray = (byte)(0.299f * r + 0.587f * g + 0.114f * b);
+
+                if (labels[i] == tumorCluster)
+                {
+                    drow[p] = (byte)(gray * 0.3f);
+                    drow[p + 1] = 255;
+                    drow[p + 2] = (byte)(gray * 0.3f);
+                }
+                else
+                {
+                    drow[p] = gray;
+                    drow[p + 1] = gray;
+                    drow[p + 2] = gray;
+                }
+            }
+        });
+
+        original.UnlockBits(src);
+        result.UnlockBits(dst);
+        return result;
+    }
+}
