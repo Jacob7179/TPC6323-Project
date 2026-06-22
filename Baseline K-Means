@@ -1,0 +1,282 @@
+// Sequential K-Means (from Brain Tumor Detection with Severity Identification Using K-Means Clustering)
+
+using System;
+using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.IO;
+using System.Linq;
+using System.Threading;
+
+const string BaseFolderPath = @"C:\Users\user\Downloads\Brain MRI\Training";
+const string OutputFolderPath = @"C:\Users\user\Downloads\Segmented Output";
+const int K = 3;
+const int BlurRadius = 2;
+
+string inputFolder = Path.GetFullPath(BaseFolderPath);
+if (!Directory.Exists(inputFolder))
+    throw new DirectoryNotFoundException(inputFolder);
+
+Directory.CreateDirectory(OutputFolderPath);
+
+string[] targetFolders = new[]
+{
+    Path.Combine(inputFolder, "glioma"),
+    Path.Combine(inputFolder, "pituitary"),
+    Path.Combine(inputFolder, "meningioma")
+};
+
+string[] files = targetFolders
+    .Where(Directory.Exists)
+    .SelectMany(folder => Directory.EnumerateFiles(folder, "*.*", SearchOption.AllDirectories))
+    .Where(IsSupportedImage)
+    .ToArray();
+
+Console.WriteLine($"Found {files.Length} images");
+
+int totalImages = 0;
+object consoleLock = new();
+
+Stopwatch sw = Stopwatch.StartNew();
+
+foreach (var file in files)
+{
+    try
+    {
+        using Bitmap original = new Bitmap(file);
+        Bitmap rgb = ConvertTo24Bit(original);
+
+        float[] gray = ToGray(rgb);
+
+        // 1. blur
+        gray = GaussianBlur(gray, rgb.Width, rgb.Height, BlurRadius);
+
+        // 2. sequential K-means
+        var (labels, centroids) = KMeansSequential(gray, K);
+
+        // 3. pick tumor cluster
+        int tumorCluster = FindBrightestCluster(centroids);
+
+        // 4. output
+        Bitmap overlay = CreateGreenOverlay(rgb, labels, tumorCluster);
+
+        string outputPath = Path.Combine(OutputFolderPath, Path.GetFileNameWithoutExtension(file) + "_tumor.png");
+        overlay.Save(outputPath, ImageFormat.Png);
+
+        overlay.Dispose();
+        rgb.Dispose();
+
+        totalImages++;
+        lock (consoleLock)
+            Console.WriteLine($"Processed: {Path.GetFileName(file)}");
+    }
+    catch (Exception ex)
+    {
+        lock (consoleLock)
+            Console.WriteLine($"Error: {file} -> {ex.Message}");
+    }
+}
+
+sw.Stop();
+Console.WriteLine("===================================");
+Console.WriteLine($"Total images: {totalImages}");
+Console.WriteLine($"Total time: {sw.Elapsed.TotalSeconds:F2} sec");
+if (totalImages > 0)
+    Console.WriteLine($"Avg per image: {sw.Elapsed.TotalMilliseconds / totalImages:F2} ms");
+Console.WriteLine("===================================");
+
+// =====================================================
+// SEQUENTIAL K-MEANS
+// =====================================================
+static (int[] labels, float[] centroids) KMeansSequential(float[] pixels, int k)
+{
+    int n = pixels.Length;
+    int[] labels = new int[n];
+    float[] centroids = new float[k];
+
+    Random rand = new Random(42);
+    for (int i = 0; i < k; i++)
+        centroids[i] = rand.Next(0, 256);
+
+    int maxIter = 20;
+
+    for (int iter = 0; iter < maxIter; iter++)
+    {
+        // ASSIGN STEP
+        for (int i = 0; i < n; i++)
+        {
+            float pix = pixels[i];
+            float best = float.MaxValue;
+            int bestK = 0;
+
+            for (int c = 0; c < k; c++)
+            {
+                float d = pix - centroids[c];
+                d *= d;
+                if (d < best)
+                {
+                    best = d;
+                    bestK = c;
+                }
+            }
+
+            labels[i] = bestK;
+        }
+
+        // UPDATE STEP
+        float[] sum = new float[k];
+        int[] count = new int[k];
+
+        for (int i = 0; i < n; i++)
+        {
+            int label = labels[i];
+            sum[label] += pixels[i];
+            count[label]++;
+        }
+
+        for (int c = 0; c < k; c++)
+        {
+            if (count[c] > 0)
+                centroids[c] = sum[c] / count[c];
+        }
+    }
+
+    return (labels, centroids);
+}
+
+// =====================================================
+// IMAGE UTILITIES
+// =====================================================
+
+static bool IsSupportedImage(string path)
+{
+    string ext = Path.GetExtension(path).ToLowerInvariant();
+    return ext is ".jpg" or ".jpeg" or ".png" or ".bmp";
+}
+
+static Bitmap ConvertTo24Bit(Bitmap src)
+{
+    Bitmap bmp = new Bitmap(src.Width, src.Height, PixelFormat.Format24bppRgb);
+    using Graphics g = Graphics.FromImage(bmp);
+    g.DrawImage(src, 0, 0);
+    return bmp;
+}
+
+static float[] ToGray(Bitmap bmp)
+{
+    int w = bmp.Width;
+    int h = bmp.Height;
+    float[] gray = new float[w * h];
+
+    BitmapData data = bmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
+    unsafe
+    {
+        byte* ptr = (byte*)data.Scan0;
+        for (int y = 0; y < h; y++)
+        {
+            byte* row = ptr + y * data.Stride;
+            for (int x = 0; x < w; x++)
+            {
+                int i = y * w + x;
+                int p = x * 3;
+                byte b = row[p], g = row[p + 1], r = row[p + 2];
+                gray[i] = 0.299f * r + 0.587f * g + 0.114f * b;
+            }
+        }
+    }
+    bmp.UnlockBits(data);
+    return gray;
+}
+
+static float[] GaussianBlur(float[] input, int w, int h, int r)
+{
+    float[] output = new float[input.Length];
+    float sigma = r / 2f;
+    float twoSigma2 = 2 * sigma * sigma;
+
+    for (int y = 0; y < h; y++)
+    {
+        for (int x = 0; x < w; x++)
+        {
+            float sum = 0;
+            float weightSum = 0;
+            for (int ky = -r; ky <= r; ky++)
+                for (int kx = -r; kx <= r; kx++)
+                {
+                    int nx = Math.Clamp(x + kx, 0, w - 1);
+                    int ny = Math.Clamp(y + ky, 0, h - 1);
+                    int i = ny * w + nx;
+                    float dist = kx * kx + ky * ky;
+                    float weight = (float)Math.Exp(-dist / twoSigma2);
+                    sum += input[i] * weight;
+                    weightSum += weight;
+                }
+            output[y * w + x] = sum / weightSum;
+        }
+    }
+
+    return output;
+}
+
+static int FindBrightestCluster(float[] centroids)
+{
+    int idx = 0;
+    float max = centroids[0];
+    for (int i = 1; i < centroids.Length; i++)
+    {
+        if (centroids[i] > max)
+        {
+            max = centroids[i];
+            idx = i;
+        }
+    }
+    return idx;
+}
+
+static Bitmap CreateGreenOverlay(Bitmap original, int[] labels, int tumorCluster)
+{
+    int w = original.Width;
+    int h = original.Height;
+    Bitmap result = new Bitmap(w, h, PixelFormat.Format24bppRgb);
+
+    BitmapData src = original.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
+    BitmapData dst = result.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.WriteOnly, PixelFormat.Format24bppRgb);
+
+    unsafe
+    {
+        byte* sp = (byte*)src.Scan0;
+        byte* dp = (byte*)dst.Scan0;
+
+        for (int y = 0; y < h; y++)
+        {
+            byte* srow = sp + y * src.Stride;
+            byte* drow = dp + y * dst.Stride;
+
+            for (int x = 0; x < w; x++)
+            {
+                int i = y * w + x;
+                int p = x * 3;
+                byte b = srow[p], g = srow[p + 1], r = srow[p + 2];
+                byte gray = (byte)(0.299f * r + 0.587f * g + 0.114f * b);
+
+                if (labels[i] == tumorCluster)
+                {
+                    drow[p] = 0;
+                    drow[p + 1] = 255;
+                    drow[p + 2] = 0;
+                }
+                else
+                {
+                    drow[p] = gray;
+                    drow[p + 1] = gray;
+                    drow[p + 2] = gray;
+                }
+            }
+        }
+    }
+
+    original.UnlockBits(src);
+    result.UnlockBits(dst);
+
+    return result;
+}
