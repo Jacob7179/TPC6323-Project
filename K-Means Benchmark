@@ -1,0 +1,373 @@
+// Combined Benchmark for K-Means (isolate)
+
+// =====================================================
+// K-Means Benchmark: Sequential vs CPU Parallel vs GPU
+// =====================================================
+
+using BenchmarkDotNet.Attributes;
+using BenchmarkDotNet.Running;
+using ILGPU;
+using ILGPU.Runtime;
+using System;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.IO;
+using System.Threading.Tasks;
+
+public class Program
+{
+    public static void Main(string[] args)
+    {
+        BenchmarkRunner.Run<KMeansBenchmark>();
+    }
+}
+
+[MemoryDiagnoser]
+public class KMeansBenchmark
+{
+    // =========================
+    // DATA (SHARED READONLY INPUT)
+    // =========================
+    private float[] pixels;
+    private int width;
+    private int height;
+
+    private const string ImagePath =
+        @"C:\Users\user\Downloads\Brain MRI\Brain MRI\Training\glioma\Tr-gl_93.jpg";
+
+    private const int K = 3;
+    private const int MaxIterations = 20;
+
+    // =========================
+    // GPU
+    // =========================
+    private Context context;
+    private Accelerator accelerator;
+
+    private Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<int>, int> assignKernel;
+    private Action<Index1D, ArrayView<float>, ArrayView<int>, int, ArrayView<float>, ArrayView<int>> reduceKernel;
+    private Action<Index1D, ArrayView<float>, ArrayView<int>, ArrayView<float>> normalizeKernel;
+
+    private MemoryBuffer1D<float, Stride1D.Dense> gpuPixels;
+    private MemoryBuffer1D<float, Stride1D.Dense> gpuCentroids;
+    private MemoryBuffer1D<int, Stride1D.Dense> gpuLabels;
+    private MemoryBuffer1D<float, Stride1D.Dense> gpuSums;
+    private MemoryBuffer1D<int, Stride1D.Dense> gpuCounts;
+
+    // =====================================================
+    // SETUP (NOT MEASURED)
+    // =====================================================
+    [GlobalSetup]
+    public void Setup()
+    {
+        using var bmp = new Bitmap(ImagePath);
+        using var rgb = new Bitmap(bmp.Width, bmp.Height, PixelFormat.Format24bppRgb);
+
+        using (Graphics g = Graphics.FromImage(rgb))
+            g.DrawImage(bmp, 0, 0);
+
+        width = rgb.Width;
+        height = rgb.Height;
+
+        pixels = ToGray(rgb);
+
+        int n = pixels.Length;
+
+        // =========================
+        // GPU INIT (ONE TIME)
+        // =========================
+        context = Context.CreateDefault();
+        accelerator = context.GetPreferredDevice(false)
+                             .CreateAccelerator(context);
+
+        assignKernel = accelerator.LoadAutoGroupedStreamKernel<
+            Index1D,
+            ArrayView<float>,
+            ArrayView<float>,
+            ArrayView<int>,
+            int>(AssignKernel);
+
+        reduceKernel = accelerator.LoadAutoGroupedStreamKernel<
+            Index1D,
+            ArrayView<float>,
+            ArrayView<int>,
+            int,
+            ArrayView<float>,
+            ArrayView<int>>(ReduceKernel);
+
+        normalizeKernel = accelerator.LoadAutoGroupedStreamKernel<
+            Index1D,
+            ArrayView<float>,
+            ArrayView<int>,
+            ArrayView<float>>(NormalizeKernel);
+
+        gpuPixels = accelerator.Allocate1D(pixels);
+        gpuLabels = accelerator.Allocate1D<int>(n);
+        gpuCentroids = accelerator.Allocate1D(new float[] { 40f, 120f, 220f });
+        gpuSums = accelerator.Allocate1D<float>(K);
+        gpuCounts = accelerator.Allocate1D<int>(K);
+
+        // warmup
+        RunGpu();
+    }
+
+    [GlobalCleanup]
+    public void Cleanup()
+    {
+        gpuPixels.Dispose();
+        gpuLabels.Dispose();
+        gpuCentroids.Dispose();
+        gpuSums.Dispose();
+        gpuCounts.Dispose();
+
+        accelerator.Dispose();
+        context.Dispose();
+    }
+
+    // =====================================================
+    // SEQUENTIAL (BASELINE)
+    // =====================================================
+    [Benchmark(Baseline = true)]
+    public void Sequential()
+    {
+        RunSequential(CloneCentroids());
+    }
+
+    // =====================================================
+    // CPU PARALLEL
+    // =====================================================
+    [Benchmark]
+    public void CPUParallel()
+    {
+        RunCpuParallel(CloneCentroids());
+    }
+
+    // =====================================================
+    // GPU
+    // =====================================================
+    [Benchmark]
+    public void GPU()
+    {
+        RunGpu();
+    }
+
+    // =====================================================
+    // CORE SEQUENTIAL
+    // =====================================================
+    void RunSequential(float[] centroids)
+    {
+        int n = pixels.Length;
+        int[] labels = new int[n];
+
+        for (int iter = 0; iter < MaxIterations; iter++)
+        {
+            for (int i = 0; i < n; i++)
+            {
+                float pix = pixels[i];
+
+                float bestDist = float.MaxValue;
+                int best = 0;
+
+                for (int c = 0; c < K; c++)
+                {
+                    float d = pix - centroids[c];
+                    d *= d;
+
+                    if (d < bestDist)
+                    {
+                        bestDist = d;
+                        best = c;
+                    }
+                }
+
+                labels[i] = best;
+            }
+
+            UpdateCentroids(pixels, labels, centroids);
+        }
+    }
+
+    // =====================================================
+    // CPU PARALLEL
+    // =====================================================
+    void RunCpuParallel(float[] centroids)
+    {
+        int n = pixels.Length;
+        int[] labels = new int[n];
+
+        for (int iter = 0; iter < MaxIterations; iter++)
+        {
+            Parallel.For(0, n, i =>
+            {
+                float pix = pixels[i];
+
+                float bestDist = float.MaxValue;
+                int best = 0;
+
+                for (int c = 0; c < K; c++)
+                {
+                    float d = pix - centroids[c];
+                    d *= d;
+
+                    if (d < bestDist)
+                    {
+                        bestDist = d;
+                        best = c;
+                    }
+                }
+
+                labels[i] = best;
+            });
+
+            UpdateCentroids(pixels, labels, centroids);
+        }
+    }
+
+    // =====================================================
+    // GPU
+    // =====================================================
+    void RunGpu()
+    {
+        int n = pixels.Length;
+
+        for (int iter = 0; iter < MaxIterations; iter++)
+        {
+            assignKernel(n, gpuPixels.View, gpuCentroids.View, gpuLabels.View, K);
+
+            gpuSums.MemSetToZero();
+            gpuCounts.MemSetToZero();
+
+            reduceKernel(n, gpuPixels.View, gpuLabels.View, K, gpuSums.View, gpuCounts.View);
+
+            normalizeKernel(K, gpuSums.View, gpuCounts.View, gpuCentroids.View);
+        }
+
+        accelerator.Synchronize();
+    }
+
+    // =====================================================
+    // CENTROID UPDATE (SHARED LOGIC)
+    // =====================================================
+    void UpdateCentroids(float[] pixels, int[] labels, float[] centroids)
+    {
+        float[] sum = new float[K];
+        int[] count = new int[K];
+
+        for (int i = 0; i < pixels.Length; i++)
+        {
+            int l = labels[i];
+            sum[l] += pixels[i];
+            count[l]++;
+        }
+
+        for (int c = 0; c < K; c++)
+        {
+            if (count[c] > 0)
+                centroids[c] = sum[c] / count[c];
+        }
+    }
+
+    // =====================================================
+    // CLONE INITIAL CENTROIDS (FAIR COMPARISON)
+    // =====================================================
+    float[] CloneCentroids()
+    {
+        return new float[] { 40f, 120f, 220f };
+    }
+
+    // =====================================================
+    // GPU KERNELS
+    // =====================================================
+    static void AssignKernel(
+        Index1D index,
+        ArrayView<float> pixels,
+        ArrayView<float> centroids,
+        ArrayView<int> labels,
+        int k)
+    {
+        float p = pixels[index];
+
+        float best = float.MaxValue;
+        int bestIdx = 0;
+
+        for (int c = 0; c < k; c++)
+        {
+            float d = p - centroids[c];
+            d *= d;
+
+            if (d < best)
+            {
+                best = d;
+                bestIdx = c;
+            }
+        }
+
+        labels[index] = bestIdx;
+    }
+
+    static void ReduceKernel(
+        Index1D index,
+        ArrayView<float> pixels,
+        ArrayView<int> labels,
+        int k,
+        ArrayView<float> sums,
+        ArrayView<int> counts)
+    {
+        int l = labels[index];
+
+        ILGPU.Atomic.Add(ref sums[l], pixels[index]);
+        ILGPU.Atomic.Add(ref counts[l], 1);
+    }
+
+    static void NormalizeKernel(
+        Index1D index,
+        ArrayView<float> sums,
+        ArrayView<int> counts,
+        ArrayView<float> centroids)
+    {
+        int c = counts[index];
+        if (c > 0)
+            centroids[index] = sums[index] / c;
+    }
+
+    // =====================================================
+    // PREPROCESSING
+    // =====================================================
+    static float[] ToGray(Bitmap bmp)
+    {
+        int w = bmp.Width;
+        int h = bmp.Height;
+
+        float[] gray = new float[w * h];
+
+        BitmapData data = bmp.LockBits(
+            new Rectangle(0, 0, w, h),
+            ImageLockMode.ReadOnly,
+            PixelFormat.Format24bppRgb);
+
+        unsafe
+        {
+            byte* ptr = (byte*)data.Scan0;
+
+            for (int y = 0; y < h; y++)
+            {
+                byte* row = ptr + y * data.Stride;
+
+                for (int x = 0; x < w; x++)
+                {
+                    int i = y * w + x;
+                    int p = x * 3;
+
+                    byte b = row[p];
+                    byte g = row[p + 1];
+                    byte r = row[p + 2];
+
+                    gray[i] = 0.299f * r + 0.587f * g + 0.114f * b;
+                }
+            }
+        }
+
+        bmp.UnlockBits(data);
+        return gray;
+    }
+}
