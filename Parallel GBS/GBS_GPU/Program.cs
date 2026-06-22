@@ -1,9 +1,4 @@
-﻿using BenchmarkDotNet.Attributes;
-using BenchmarkDotNet.Running;
-using ILGPU;
-using ILGPU.Runtime;
-using ILGPU.Runtime.Cuda;
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -12,6 +7,41 @@ using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using ILGPU;
+using ILGPU.Runtime;
+using ILGPU.Runtime.Cuda;
+using BenchmarkDotNet.Attributes;
+using BenchmarkDotNet.Running;
+
+// ============================================================
+//  BENCHMARKDOTNET WRAPPER (PUBLIC TOP-LEVEL CLASS)
+// ============================================================
+public class GraphSegBenchmark
+{
+    [Benchmark]
+    public void FullApplicationExecution()
+    {
+        string assemblyPath = typeof(GraphSegBenchmark).Assembly.Location;
+        ProcessStartInfo startInfo = new("dotnet")
+        {
+            ArgumentList = { assemblyPath, "--run-once" },
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+
+        using Process? process = Process.Start(startInfo);
+        if (process is null)
+            throw new InvalidOperationException("Failed to start benchmark process.");
+
+        string output = process.StandardOutput.ReadToEnd();
+        string error = process.StandardError.ReadToEnd();
+        process.WaitForExit();
+
+        if (process.ExitCode != 0)
+            throw new InvalidOperationException($"Benchmark failed: {error}\n{output}");
+    }
+}
 
 class Program
 {
@@ -56,7 +86,6 @@ class Program
 
         var random = new Random(42); // fixed seed for reproducibility
 
-        // take per class (balanced)
         string[] glioma = Directory.GetFiles(targetFolders[0], "*", SearchOption.AllDirectories)
             .Where(IsSupportedImage)
             .OrderBy(_ => random.Next())
@@ -75,14 +104,12 @@ class Program
             .Take(34)
             .ToArray();
 
-        // merge final dataset
         string[] files = glioma
             .Concat(pituitary)
             .Concat(meningioma)
             .ToArray();
 
         Console.WriteLine($"Balanced dataset size: {files.Length}");
-        Console.WriteLine($"Found {files.Length} images");
 
         // Manual benchmark mode (sequential)
         if (runBenchmark || args.Contains("--benchmark", StringComparer.OrdinalIgnoreCase))
@@ -196,10 +223,7 @@ class Program
 
         float[] gray = ToGray(rgb);
 
-        // GPU blur
         gray = GpuBlur.Apply(gray, rgb.Width, rgb.Height, BlurRadius);
-
-        // Segmentation
         int[] labels = GraphSegmentation(gray, rgb.Width, rgb.Height);
         int tumorLabel = BestTumorComponent(labels, gray, rgb.Width, rgb.Height);
 
@@ -213,11 +237,7 @@ class Program
 
         swImage.Stop();
 
-        double processingTime = swImage.Elapsed.TotalMilliseconds; // pure algorithm time
-        // For a more accurate "image execution time" we include I/O and overhead,
-        // which is already included in swImage. We'll use the same value for both
-        // to keep it simple. If you want to separate, you could measure differently.
-
+        double processingTime = swImage.Elapsed.TotalMilliseconds;
         return new ImageRunResult(outFile, new FullBenchmarkTiming(processingTime, processingTime));
     }
 
@@ -264,36 +284,6 @@ class Program
         Console.WriteLine($"{label} average execution time: {summary.AverageImageExecutionTimeMs:F2} ms");
         Console.WriteLine($"{label} min execution time: {summary.MinImageExecutionTimeMs:F2} ms");
         Console.WriteLine($"{label} max execution time: {summary.MaxImageExecutionTimeMs:F2} ms");
-    }
-
-    // ------------------------------------------------------------
-    //  BENCHMARKDOTNET WRAPPER
-    // ------------------------------------------------------------
-    public class GraphSegBenchmark
-    {
-        [Benchmark]
-        public void FullApplicationExecution()
-        {
-            string assemblyPath = typeof(GraphSegBenchmark).Assembly.Location;
-            ProcessStartInfo startInfo = new("dotnet")
-            {
-                ArgumentList = { assemblyPath, "--run-once" },
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true
-            };
-
-            using Process? process = Process.Start(startInfo);
-            if (process is null)
-                throw new InvalidOperationException("Failed to start benchmark process.");
-
-            string output = process.StandardOutput.ReadToEnd();
-            string error = process.StandardError.ReadToEnd();
-            process.WaitForExit();
-
-            if (process.ExitCode != 0)
-                throw new InvalidOperationException($"Benchmark failed: {error}\n{output}");
-        }
     }
 
     // ============================================================
