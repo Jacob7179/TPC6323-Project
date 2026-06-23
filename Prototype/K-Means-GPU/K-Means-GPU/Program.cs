@@ -1370,15 +1370,25 @@ class Program
             position: absolute;
             top: -18px;
             right: -18px;
+            z-index: 2;
             width: 42px;
             min-height: 42px;
             height: 42px;
-            border: 1px solid rgba(21, 35, 31, .14);
+            border: 2px solid #ffffff;
             border-radius: 999px;
-            background: #ffffff;
-            color: var(--ink);
+            background: #d92d20;
+            color: #ffffff;
             padding: 0;
-            box-shadow: 0 14px 28px rgba(18, 35, 31, .18);
+            box-shadow: 0 14px 28px rgba(167, 53, 66, .28);
+            transition: background .16s ease, box-shadow .16s ease, transform .16s ease;
+        }
+
+        .lightbox-close:hover,
+        .lightbox-close:focus-visible {
+            background: #b42318;
+            box-shadow: 0 16px 32px rgba(167, 53, 66, .36);
+            transform: translateY(-1px);
+            outline: none;
         }
 
         .lightbox-close::before,
