@@ -8,19 +8,9 @@ using ILGPU.Runtime.OpenCL;
 using BenchmarkDotNet.Attributes;
 using BenchmarkDotNet.Running;
 
-const int Superpixels = 500; // Number of superpixels. Higher = smaller regions, more detail.
-const int Iterations = 8; // SLIC update rounds. Higher = more stable, but slower.
-const float Compactness = 10f; // Shape control. Higher = smoother/squarer superpixels, lower = follows edges more.
-const float TumorSensitivity = 0.7f; // Tumor threshold strictness. Higher = fewer highlighted areas, lower = more sensitive.
-const float TumorPercentile = 75f; // Keeps only bright superpixels above this percentile. Higher = fewer candidates.
-const float BrainRadiusFactor = 0.30f; // Removes far outer regions. Lower = stricter against skull/skin edge.
-const bool UseBrainRoi = true; // true = only search inside the brain ROI below.
-const float BrainRoiLeft = 0.56f; // ROI left boundary as image width ratio. Lower if tumor is missed on the left.
-const float BrainRoiTop = 0.41f; // ROI top boundary as image height ratio. Increase to ignore top skull edge.
-const float BrainRoiRight = 0.65f; // ROI right boundary as image width ratio. Lower to ignore right skull edge.
-const float BrainRoiBottom = 0.49f; // ROI bottom boundary as image height ratio. Lower to ignore face/neck areas.
+// SLIC and tumor-candidate settings are chosen automatically per image below.
 const string InputFolderPath = @"E:\TPC Preprocessing\Preprocess Dataset"; // Put the folder containing preprocessed grayscale images here.
-const string OutputFolderPath = @"E:\TPC SPL\Parallel Slic (Full Benchmark Check)\SLIC_GPU\output";
+const string OutputFolderPath = @"E:\TPC_SLIC\Parallel Slic (Full Benchmark Check)\SLIC_GPU\output";
 const bool RunBenchmarkDotNet = false; // Set true and click Run to execute BenchmarkDotNet instead of normal output generation.
 
 bool runOnce = args.Contains("--run-once", StringComparer.OrdinalIgnoreCase);
@@ -191,7 +181,8 @@ static Bitmap ConvertTo24BitRgb(Bitmap source)
 static int[] RunGpuSlic(ImageData image)
 {
     int n = image.Width * image.Height;
-    int step = Math.Max(1, (int)Math.Sqrt(n / (double)Superpixels));
+    AutoSlicSettings settings = ChooseSlicSettings(image);
+    int step = settings.Step;
     List<Center> centers = CreateCenters(image, step);
     int[] labels = new int[n];
 
@@ -199,6 +190,7 @@ static int[] RunGpuSlic(ImageData image)
     Device device = PickGpuDevice(context);
     using Accelerator accelerator = device.CreateAccelerator(context);
     Console.WriteLine("ILGPU accelerator: " + accelerator);
+    PrintSlicSettings(settings);
 
     using MemoryBuffer1D<float, Stride1D.Dense> dGray = accelerator.Allocate1D(image.Gray);
     using MemoryBuffer1D<float, Stride1D.Dense> dCg = accelerator.Allocate1D<float>(centers.Count);
@@ -209,7 +201,7 @@ static int[] RunGpuSlic(ImageData image)
     var kernel = accelerator.LoadAutoGroupedStreamKernel<Index1D, SlicViews, SlicSettings>(AssignLabelsKernel);
     float[] cg = new float[centers.Count], cx = new float[centers.Count], cy = new float[centers.Count];
 
-    for (int iter = 0; iter < Iterations; iter++)
+    for (int iter = 0; iter < settings.Iterations; iter++)
     {
         for (int i = 0; i < centers.Count; i++)
         {
@@ -223,7 +215,7 @@ static int[] RunGpuSlic(ImageData image)
         dCy.CopyFromCPU(cy);
 
         kernel(n, new SlicViews(dGray.View, dCg.View, dCx.View, dCy.View, dLabels.View),
-            new SlicSettings(image.Width, centers.Count, step * 2, Compactness * Compactness / (step * step)));
+            new SlicSettings(image.Width, centers.Count, settings.SearchRadius, settings.SpatialWeight));
         accelerator.Synchronize();
         dLabels.CopyToCPU(labels);
         UpdateCenters(image, labels, centers);
@@ -241,6 +233,45 @@ static Device PickGpuDevice(Context context)
     if (openCl.Count > 0) return openCl[0];
 
     throw new InvalidOperationException("No CUDA/OpenCL GPU device found. Please install NVIDIA CUDA driver or OpenCL runtime.");
+}
+
+static AutoSlicSettings ChooseSlicSettings(ImageData image)
+{
+    int n = image.Width * image.Height;
+    int minDimension = Math.Max(1, Math.Min(image.Width, image.Height));
+    float tissueThreshold = Otsu(image.Gray) * 0.6f;
+    int tissuePixels = 0;
+
+    foreach (float gray in image.Gray)
+        if (gray > tissueThreshold)
+            tissuePixels++;
+
+    float tissueRatio = tissuePixels / (float)Math.Max(1, n);
+    int desiredStep = Math.Clamp((int)MathF.Round(minDimension / 24f), 8, 28);
+    if (tissueRatio > 0 && tissueRatio < 0.35f)
+        desiredStep = Math.Max(6, desiredStep - 2);
+
+    int superpixels = Math.Clamp((int)MathF.Round(n / (float)(desiredStep * desiredStep)), 80, 1400);
+    int step = Math.Max(1, (int)Math.Sqrt(n / (double)superpixels));
+    float contrast = EstimateRobustContrast(image.Gray);
+    float compactnessRatio = contrast < 45f ? 0.58f : contrast > 110f ? 0.38f : 0.48f;
+    float compactness = Math.Clamp(step * compactnessRatio, 6f, 16f);
+    int iterations = Math.Clamp(5 + (int)MathF.Round(MathF.Log2(MathF.Max(2, step))), 6, 10);
+
+    return new AutoSlicSettings(superpixels, step, iterations, compactness);
+}
+
+static float EstimateRobustContrast(float[] gray)
+{
+    List<float> sorted = new(gray);
+    sorted.Sort();
+    return Percentile(sorted, 90f) - Percentile(sorted, 10f);
+}
+
+static void PrintSlicSettings(AutoSlicSettings settings)
+{
+    Console.WriteLine(
+        $"Auto SLIC settings: superpixels={settings.Superpixels}, step={settings.Step}, compactness={settings.Compactness:F1}, iterations={settings.Iterations}");
 }
 
 static List<Center> CreateCenters(ImageData image, int step)
@@ -299,28 +330,9 @@ static bool[] DetectTumorCandidates(ImageData image, int[] labels)
 
 static LabelStats[] BuildLabelStats(ImageData image, int[] labels, int labelCount, out BrainInfo brain)
 {
-    float tissue = Otsu(image.Gray) * 0.6f;
-    int roiLeft = UseBrainRoi ? (int)(image.Width * BrainRoiLeft) : 0;
-    int roiTop = UseBrainRoi ? (int)(image.Height * BrainRoiTop) : 0;
-    int roiRight = UseBrainRoi ? (int)(image.Width * BrainRoiRight) : image.Width - 1;
-    int roiBottom = UseBrainRoi ? (int)(image.Height * BrainRoiBottom) : image.Height - 1;
-    double sx = 0, sy = 0;
-    int tissuePixels = 0;
-
-    for (int y = 0; y < image.Height; y++)
-        for (int x = 0; x < image.Width; x++)
-        {
-            int i = y * image.Width + x;
-            if (image.Gray[i] <= tissue || x < roiLeft || x > roiRight || y < roiTop || y > roiBottom) continue;
-            sx += x;
-            sy += y;
-            tissuePixels++;
-        }
-
-    float bx = tissuePixels == 0 ? image.Width / 2f : (float)(sx / tissuePixels);
-    float by = tissuePixels == 0 ? image.Height / 2f : (float)(sy / tissuePixels);
-    float radius = Math.Min(image.Width, image.Height) * BrainRadiusFactor;
-    brain = new BrainInfo(bx, by, radius, tissue, roiLeft, roiTop, roiRight, roiBottom);
+    brain = BuildBrainInfo(image);
+    float tissue = brain.TissueThreshold;
+    float bx = brain.X, by = brain.Y, radius = brain.Radius;
 
     LabelStats[] stats = Enumerable.Range(0, labelCount).Select(_ => new LabelStats()).ToArray();
     int margin = Math.Max(2, Math.Min(image.Width, image.Height) / 100);
@@ -347,6 +359,56 @@ static LabelStats[] BuildLabelStats(ImageData image, int[] labels, int labelCoun
     return stats;
 }
 
+static BrainInfo BuildBrainInfo(ImageData image)
+{
+    float tissue = Otsu(image.Gray) * 0.6f;
+    List<float> xs = new();
+    List<float> ys = new();
+    double sx = 0, sy = 0;
+
+    for (int y = 0; y < image.Height; y++)
+        for (int x = 0; x < image.Width; x++)
+        {
+            int i = y * image.Width + x;
+            if (image.Gray[i] <= tissue) continue;
+            xs.Add(x);
+            ys.Add(y);
+            sx += x;
+            sy += y;
+        }
+
+    if (xs.Count == 0)
+    {
+        float fallbackRadius = Math.Min(image.Width, image.Height) * 0.5f;
+        return new BrainInfo(image.Width / 2f, image.Height / 2f, fallbackRadius, tissue, 0, 0, image.Width - 1, image.Height - 1);
+    }
+
+    xs.Sort();
+    ys.Sort();
+    float bx = (float)(sx / xs.Count);
+    float by = (float)(sy / ys.Count);
+    int roiLeft = Math.Clamp((int)MathF.Floor(Percentile(xs, 3f)), 0, image.Width - 1);
+    int roiTop = Math.Clamp((int)MathF.Floor(Percentile(ys, 3f)), 0, image.Height - 1);
+    int roiRight = Math.Clamp((int)MathF.Ceiling(Percentile(xs, 97f)), roiLeft, image.Width - 1);
+    int roiBottom = Math.Clamp((int)MathF.Ceiling(Percentile(ys, 97f)), roiTop, image.Height - 1);
+    List<float> distances = new(xs.Count);
+
+    for (int y = 0; y < image.Height; y++)
+        for (int x = 0; x < image.Width; x++)
+        {
+            int i = y * image.Width + x;
+            if (image.Gray[i] <= tissue) continue;
+            float dx = x - bx, dy = y - by;
+            distances.Add(MathF.Sqrt(dx * dx + dy * dy));
+        }
+
+    distances.Sort();
+    float minDimension = Math.Min(image.Width, image.Height);
+    float radius = Math.Clamp(Percentile(distances, 90f), minDimension * 0.20f, minDimension * 0.55f);
+
+    return new BrainInfo(bx, by, radius, tissue, roiLeft, roiTop, roiRight, roiBottom);
+}
+
 static bool[] PickBrightCandidateLabels(LabelStats[] stats, BrainInfo brain)
 {
     List<float> means = new();
@@ -362,11 +424,19 @@ static bool[] PickBrightCandidateLabels(LabelStats[] stats, BrainInfo brain)
         count += s.Count;
     }
 
+    bool[] candidates = new bool[stats.Length];
+    if (means.Count == 0)
+        return candidates;
+
     means.Sort();
     float mean = count == 0 ? 0 : (float)(sum / count);
     float std = count == 0 ? 0 : MathF.Sqrt(MathF.Max(0, (float)(sumSq / count - mean * mean)));
-    float threshold = MathF.Max(mean + TumorSensitivity * std, Percentile(means, TumorPercentile));
-    bool[] candidates = new bool[stats.Length];
+    float q25 = Percentile(means, 25f);
+    float q75 = Percentile(means, 75f);
+    float q90 = Percentile(means, 90f);
+    float spread = MathF.Max(1f, q90 - q25);
+    float sensitivity = Math.Clamp(spread / 96f, 0.45f, 0.85f);
+    float threshold = MathF.Min(q90, MathF.Max(q75, mean + sensitivity * std));
 
     for (int i = 0; i < stats.Length; i++)
         candidates[i] = IsBrainLabel(stats[i], brain) && stats[i].Mean >= threshold;
@@ -594,6 +664,11 @@ class BenchmarkSummary
 }
 
 record ImageData(int Width, int Height, byte[] R, byte[] G, byte[] B, float[] Gray);
+record struct AutoSlicSettings(int Superpixels, int Step, int Iterations, float Compactness)
+{
+    public int SearchRadius => Step * 2;
+    public float SpatialWeight => Compactness * Compactness / Math.Max(1, Step * Step);
+}
 record struct Center(float Gray, float X, float Y);
 record struct BrainInfo(
     float X,
