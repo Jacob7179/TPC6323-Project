@@ -1,13 +1,13 @@
-// CPU-Parallelism K-Means
-
+// GPU-Parallelism K-Means (perfect)
 using System;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
 using System.Linq;
-using System.Threading;
 using System.Threading.Tasks;
+using ILGPU;
+using ILGPU.Runtime;
 
 class Program
 {
@@ -64,6 +64,18 @@ Console.WriteLine($"Balanced dataset size: {files.Length} (33 glioma, 33 pituita
 
         Console.WriteLine($"Found {files.Length} images");
 
+        using Context context = Context.CreateDefault();
+        using Accelerator accelerator =
+            context.GetPreferredDevice(preferCPU: false)
+                   .CreateAccelerator(context);
+
+        Console.WriteLine($"Using GPU: {accelerator.Name}");
+
+        // Load K-Means kernels
+        var assignKernel = accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<int>, int>(AssignClustersKernel);
+        var reduceKernel = accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<int>, int, ArrayView<float>, ArrayView<int>>(CentroidReduceKernel);
+        var normalizeKernel = accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<int>, ArrayView<float>>(CentroidNormalizeKernel);
+
         int totalImages = 0;
         object consoleLock = new();
         Stopwatch sw = Stopwatch.StartNew();
@@ -75,25 +87,22 @@ Console.WriteLine($"Balanced dataset size: {files.Length} (33 glioma, 33 pituita
                 using Bitmap original = new Bitmap(file);
                 using Bitmap rgb = ConvertTo24Bit(original);
 
+                // CPU preprocessing
                 float[] gray = GetGrayBytes(rgb);
                 gray = GaussianBlurCPU(gray, rgb.Width, rgb.Height, BlurRadius);
 
-                var (labels, centroids) = KMeansCPU(gray, rgb.Width, rgb.Height, K);
+                // Run GPU K-Means
+                var (labels, centroids) = KMeansGPU(accelerator, assignKernel, reduceKernel, normalizeKernel, gray, rgb.Width, rgb.Height, K);
 
                 int tumorCluster = FindTumorCluster(labels, centroids, rgb.Width, rgb.Height);
 
                 using Bitmap overlay = CreateGreenOverlayFast(rgb, labels, tumorCluster);
 
-                string outputPath = Path.Combine(
-                    OutputFolderPath,
-                    Path.GetFileNameWithoutExtension(file) + "_tumor.png"
-                );
-
+                string outputPath = Path.Combine(OutputFolderPath, Path.GetFileNameWithoutExtension(file) + "_tumor.png");
                 overlay.Save(outputPath, ImageFormat.Png);
 
-                Interlocked.Increment(ref totalImages);
-                lock (consoleLock)
-                    Console.WriteLine($"Processed: {Path.GetFileName(file)}");
+                System.Threading.Interlocked.Increment(ref totalImages);
+                lock (consoleLock) Console.WriteLine($"Processed: {Path.GetFileName(file)}");
             }
             catch (Exception ex)
             {
@@ -106,7 +115,6 @@ Console.WriteLine($"Balanced dataset size: {files.Length} (33 glioma, 33 pituita
         });
 
         sw.Stop();
-
         Console.WriteLine();
         Console.WriteLine("=================================");
         Console.WriteLine($"Total images : {totalImages}");
@@ -116,94 +124,163 @@ Console.WriteLine($"Balanced dataset size: {files.Length} (33 glioma, 33 pituita
         Console.WriteLine("=================================");
     }
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     // =====================================================
-    // CPU K-MEANS
+    // GPU K-MEANS (labels + centroids)
     // =====================================================
-    static (int[] labels, float[] centroids) KMeansCPU(float[] pixels, int width, int height, int k)
+    static (int[] labels, float[] centroids) KMeansGPU(
+        Accelerator accelerator,
+        Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<int>, int> assignKernel,
+        Action<Index1D, ArrayView<float>, ArrayView<int>, int, ArrayView<float>, ArrayView<int>> reduceKernel,
+        Action<Index1D, ArrayView<float>, ArrayView<int>, ArrayView<float>> normalizeKernel,
+        float[] grayPixels,
+        int width,
+        int height,
+        int k)
     {
         int n = width * height;
 
-        float[] centroids = { 40f, 120f, 220f };
-        int[] labels = new int[n];
+        // CPU initial centroids (ONLY for first upload)
+        float[] centroidsInit = new float[k];
+        centroidsInit[0] = 40;
+        centroidsInit[1] = 120;
+        centroidsInit[2] = 220;
 
-        float[] sums = new float[k];
-        int[] counts = new int[k];
+        using var gpuPixels = accelerator.Allocate1D(grayPixels);
+        using var gpuLabels = accelerator.Allocate1D<int>(n);
+        using var gpuCentroids = accelerator.Allocate1D<float>(centroidsInit);
+        using var gpuSums = accelerator.Allocate1D<float>(k);
+        using var gpuCounts = accelerator.Allocate1D<int>(k);
 
         for (int iter = 0; iter < MaxIterations; iter++)
         {
-            // reset
-            Array.Clear(sums, 0, k);
-            Array.Clear(counts, 0, k);
+            assignKernel(n, gpuPixels.View, gpuCentroids.View, gpuLabels.View, k);
+            accelerator.Synchronize();
 
-            object lockObj = new();
+            gpuSums.MemSetToZero();
+            gpuCounts.MemSetToZero();
 
-            Parallel.For(0, n,
-                () => (localSums: new float[k], localCounts: new int[k]),
-                (i, state, local) =>
-                {
-                    float pix = pixels[i];
+            reduceKernel(n, gpuPixels.View, gpuLabels.View, k, gpuSums.View, gpuCounts.View);
+            accelerator.Synchronize();
 
-                    int best = 0;
-                    float bestDist = float.MaxValue;
-
-                    for (int c = 0; c < k; c++)
-                    {
-                        float d = pix - centroids[c];
-                        d *= d;
-
-                        if (d < bestDist)
-                        {
-                            bestDist = d;
-                            best = c;
-                        }
-                    }
-
-                    labels[i] = best;
-
-                    local.localSums[best] += pix;
-                    local.localCounts[best]++;
-
-                    return local;
-                },
-                local =>
-                {
-                    lock (lockObj)
-                    {
-                        for (int c = 0; c < k; c++)
-                        {
-                            sums[c] += local.localSums[c];
-                            counts[c] += local.localCounts[c];
-                        }
-                    }
-                });
-
-            for (int c = 0; c < k; c++)
-            {
-                if (counts[c] > 0)
-                    centroids[c] = sums[c] / counts[c];
-            }
+            normalizeKernel(k, gpuSums.View, gpuCounts.View, gpuCentroids.View);
+            accelerator.Synchronize();
         }
+
+        // FINAL READBACK ONLY
+        float[] centroids = gpuCentroids.GetAsArray1D();
+        int[] labels = gpuLabels.GetAsArray1D();
 
         return (labels, centroids);
     }
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     // =====================================================
-    // PREPROCESSING
+    // GPU KERNELS
+    // =====================================================
+    static void AssignClustersKernel(Index1D index, ArrayView<float> pixels, ArrayView<float> centroids, ArrayView<int> labels, int k)
+    {
+        if (index >= pixels.Length) return;
+        float pix = pixels[index];
+        float bestDist = float.MaxValue; int bestCluster = 0;
+        for (int c = 0; c < k; c++)
+        {
+            float d = pix - centroids[c]; d *= d;
+            if (d < bestDist) { bestDist = d; bestCluster = c; }
+        }
+        labels[index] = bestCluster;
+    }
+
+    static void CentroidReduceKernel(Index1D index, ArrayView<float> pixels, ArrayView<int> labels, int k, ArrayView<float> sums, ArrayView<int> counts)
+    {
+        if (index >= pixels.Length) return;
+        int label = labels[index];
+        ILGPU.Atomic.Add(ref sums[label], pixels[index]);
+        ILGPU.Atomic.Add(ref counts[label], 1);
+    }
+
+    static void CentroidNormalizeKernel(
+    Index1D index,
+    ArrayView<float> sums,
+    ArrayView<int> counts,
+    ArrayView<float> centroids)
+    {
+        if (index >= centroids.Length) return;
+
+        int count = counts[index];
+        if (count > 0)
+            centroids[index] = sums[index] / count;
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    // =====================================================
+    // CPU PREPROCESSING
     // =====================================================
     static float[] GetGrayBytes(Bitmap bmp)
     {
         int w = bmp.Width, h = bmp.Height;
         float[] gray = new float[w * h];
-
-        BitmapData bmpData = bmp.LockBits(
-            new Rectangle(0, 0, w, h),
-            ImageLockMode.ReadOnly,
-            PixelFormat.Format24bppRgb);
-
+        BitmapData bmpData = bmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
         unsafe
         {
             byte* ptr = (byte*)bmpData.Scan0;
-
             for (int y = 0; y < h; y++)
                 for (int x = 0; x < w; x++)
                 {
@@ -212,7 +289,6 @@ Console.WriteLine($"Balanced dataset size: {files.Length} (33 glioma, 33 pituita
                     gray[y * w + x] = 0.299f * r + 0.587f * g + 0.114f * b;
                 }
         }
-
         bmp.UnlockBits(bmpData);
         return gray;
     }
@@ -223,60 +299,99 @@ Console.WriteLine($"Balanced dataset size: {files.Length} (33 glioma, 33 pituita
 
         float sigma = r / 2f;
         float twoSigma2 = 2 * sigma * sigma;
-
         float[] kernel = new float[r * 2 + 1];
-        for (int i = -r; i <= r; i++)
-            kernel[i + r] = MathF.Exp(-(i * i) / twoSigma2);
-
+        for (int i = -r; i <= r; i++) kernel[i + r] = MathF.Exp(-(i * i) / twoSigma2);
         float sumK = kernel.Sum();
-        for (int i = 0; i < kernel.Length; i++)
-            kernel[i] /= sumK;
+        for (int i = 0; i < kernel.Length; i++) kernel[i] /= sumK;
 
         float[] tmp = new float[w * h];
-        float[] res = new float[w * h];
-
-        Parallel.For(0, h, y =>
-        {
+        // Horizontal blur
+        for (int y = 0; y < h; y++)
             for (int x = 0; x < w; x++)
             {
                 float s = 0;
-
                 for (int k = -r; k <= r; k++)
                 {
                     int xx = Math.Clamp(x + k, 0, w - 1);
                     s += img[y * w + xx] * kernel[k + r];
                 }
-
                 tmp[y * w + x] = s;
             }
-        });
 
-        Parallel.For(0, h, y =>
-        {
+        float[] res = new float[w * h];
+        // Vertical blur
+        for (int y = 0; y < h; y++)
             for (int x = 0; x < w; x++)
             {
                 float s = 0;
-
                 for (int k = -r; k <= r; k++)
                 {
                     int yy = Math.Clamp(y + k, 0, h - 1);
                     s += tmp[yy * w + x] * kernel[k + r];
                 }
-
                 res[y * w + x] = s;
             }
-        });
 
         return res;
     }
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     // =====================================================
-    // UTILITIES (unchanged)
+    // UTILITIES
     // =====================================================
     static bool IsSupportedImage(string path)
     {
         string ext = Path.GetExtension(path).ToLowerInvariant();
-        return ext is ".jpg" or ".jpeg" or ".png" or ".bmp";
+        return ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".bmp";
     }
 
     static Bitmap ConvertTo24Bit(Bitmap src)
@@ -291,44 +406,24 @@ Console.WriteLine($"Balanced dataset size: {files.Length} (33 glioma, 33 pituita
     {
         int k = centroids.Length;
         int[] counts = new int[k];
-
-        foreach (int l in labels)
-            counts[l]++;
-
-        int best = 0;
-        float bestScore = float.MinValue;
-
+        foreach (int label in labels) counts[label]++;
+        int bestCluster = 0; float bestScore = float.MinValue;
         for (int c = 0; c < k; c++)
         {
             float brightness = centroids[c];
             float sizePenalty = counts[c] / (float)(w * h);
             float score = brightness - sizePenalty * 120f;
-
-            if (score > bestScore)
-            {
-                bestScore = score;
-                best = c;
-            }
+            if (score > bestScore) { bestScore = score; bestCluster = c; }
         }
-
-        return best;
+        return bestCluster;
     }
 
     static unsafe Bitmap CreateGreenOverlayFast(Bitmap original, int[] labels, int tumorCluster)
     {
         int w = original.Width, h = original.Height;
         Bitmap result = new(w, h, PixelFormat.Format24bppRgb);
-
-        BitmapData src = original.LockBits(
-            new Rectangle(0, 0, w, h),
-            ImageLockMode.ReadOnly,
-            PixelFormat.Format24bppRgb);
-
-        BitmapData dst = result.LockBits(
-            new Rectangle(0, 0, w, h),
-            ImageLockMode.WriteOnly,
-            PixelFormat.Format24bppRgb);
-
+        BitmapData src = original.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
+        BitmapData dst = result.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.WriteOnly, PixelFormat.Format24bppRgb);
         byte* sp = (byte*)src.Scan0;
         byte* dp = (byte*)dst.Scan0;
 
@@ -337,12 +432,9 @@ Console.WriteLine($"Balanced dataset size: {files.Length} (33 glioma, 33 pituita
             byte* srow = sp + y * src.Stride;
             byte* drow = dp + y * dst.Stride;
             int baseIdx = y * w;
-
             for (int x = 0; x < w; x++)
             {
-                int i = baseIdx + x;
-                int p = x * 3;
-
+                int i = baseIdx + x, p = x * 3;
                 byte b = srow[p], g = srow[p + 1], r = srow[p + 2];
                 byte gray = (byte)(0.299f * r + 0.587f * g + 0.114f * b);
 
@@ -354,15 +446,12 @@ Console.WriteLine($"Balanced dataset size: {files.Length} (33 glioma, 33 pituita
                 }
                 else
                 {
-                    drow[p] = gray;
-                    drow[p + 1] = gray;
-                    drow[p + 2] = gray;
+                    drow[p] = gray; drow[p + 1] = gray; drow[p + 2] = gray;
                 }
             }
         });
 
-        original.UnlockBits(src);
-        result.UnlockBits(dst);
+        original.UnlockBits(src); result.UnlockBits(dst);
         return result;
     }
 }
