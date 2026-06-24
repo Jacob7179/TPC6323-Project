@@ -10,38 +10,6 @@ using System.Threading.Tasks;
 using ILGPU;
 using ILGPU.Runtime;
 using ILGPU.Runtime.Cuda;
-using BenchmarkDotNet.Attributes;
-using BenchmarkDotNet.Running;
-
-// ============================================================
-//  BENCHMARKDOTNET WRAPPER (PUBLIC TOP-LEVEL CLASS)
-// ============================================================
-public class GraphSegBenchmark
-{
-    [Benchmark]
-    public void FullApplicationExecution()
-    {
-        string assemblyPath = typeof(GraphSegBenchmark).Assembly.Location;
-        ProcessStartInfo startInfo = new("dotnet")
-        {
-            ArgumentList = { assemblyPath, "--run-once" },
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true
-        };
-
-        using Process? process = Process.Start(startInfo);
-        if (process is null)
-            throw new InvalidOperationException("Failed to start benchmark process.");
-
-        string output = process.StandardOutput.ReadToEnd();
-        string error = process.StandardError.ReadToEnd();
-        process.WaitForExit();
-
-        if (process.ExitCode != 0)
-            throw new InvalidOperationException($"Benchmark failed: {error}\n{output}");
-    }
-}
 
 class Program
 {
@@ -53,29 +21,16 @@ class Program
     const int MinSize = 100;
     const int BlurRadius = 2;
 
-    // ================== BENCHMARK SETTINGS ==================
-    const bool RunBenchmarkDotNet = false;   // Set true to use BenchmarkDotNet
-    const string BenchmarkLabel = "GraphSeg"; // Label used in benchmark output
-
     // ===================================================
 
     static void Main(string[] args)
     {
-        bool runOnce = args.Contains("--run-once", StringComparer.OrdinalIgnoreCase);
-        bool runBenchmark = args.Contains("--benchmark", StringComparer.OrdinalIgnoreCase);
-
-        // BenchmarkDotNet mode
-        if ((RunBenchmarkDotNet && !runOnce) || args.Contains("--benchmark-dotnet", StringComparer.OrdinalIgnoreCase))
-        {
-            BenchmarkRunner.Run<GraphSegBenchmark>();
-            return;
-        }
+        Directory.CreateDirectory(OutputFolderPath);
 
         // --------------------------------------------------
         // BALANCED DATASET SAMPLING (100 images total)
         // --------------------------------------------------
         string inputFolder = Path.GetFullPath(BaseFolderPath);
-        Directory.CreateDirectory(OutputFolderPath);
 
         string[] targetFolders = new[]
         {
@@ -111,64 +66,53 @@ class Program
 
         Console.WriteLine($"Balanced dataset size: {files.Length}");
 
-        // Manual benchmark mode (sequential)
-        if (runBenchmark || args.Contains("--benchmark", StringComparer.OrdinalIgnoreCase))
-        {
-            RunManualBenchmark(files);
-            return;
-        }
-
-        // Normal parallel processing
-        RunNormalProcessing(files);
+        // --------------------------------------------------
+        // SEQUENTIAL PROCESSING
+        // --------------------------------------------------
+        RunSequentialProcessing(files);
     }
 
     // ------------------------------------------------------------
-    //  NORMAL PARALLEL PROCESSING
+    //  SEQUENTIAL PROCESSING
     // ------------------------------------------------------------
-    static void RunNormalProcessing(string[] files)
+    static void RunSequentialProcessing(string[] files)
     {
+        if (files.Length == 0)
+            throw new InvalidOperationException("No input images found.");
+
+        Console.WriteLine($"Processing {files.Length} images sequentially...");
         Stopwatch swTotal = Stopwatch.StartNew();
+
         int total = 0;
-        object consoleLock = new();
 
-        Parallel.ForEach(
-            files,
-            new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
-            file =>
+        foreach (string file in files)
+        {
+            try
             {
-                try
-                {
-                    using Bitmap original = new Bitmap(file);
-                    using Bitmap rgb = ConvertTo24Bit(original);
+                using Bitmap original = new Bitmap(file);
+                using Bitmap rgb = ConvertTo24Bit(original);
 
-                    float[] gray = ToGray(rgb);
-                    gray = GpuBlur.Apply(gray, rgb.Width, rgb.Height, BlurRadius);
-                    int[] labels = GraphSegmentation(gray, rgb.Width, rgb.Height);
-                    int tumorLabel = BestTumorComponent(labels, gray, rgb.Width, rgb.Height);
+                float[] gray = ToGray(rgb);
+                gray = GpuBlur.Apply(gray, rgb.Width, rgb.Height, BlurRadius);
+                int[] labels = GraphSegmentation(gray, rgb.Width, rgb.Height);
+                int tumorLabel = BestTumorComponent(labels, gray, rgb.Width, rgb.Height);
 
-                    using Bitmap result = CreateGreenOverlay(rgb, labels, tumorLabel);
+                using Bitmap result = CreateGreenOverlay(rgb, labels, tumorLabel);
 
-                    string outFile = Path.Combine(
-                        OutputFolderPath,
-                        Path.GetFileNameWithoutExtension(file) + "_graph.png");
+                string outFile = Path.Combine(
+                    OutputFolderPath,
+                    Path.GetFileNameWithoutExtension(file) + "_graph.png");
 
-                    result.Save(outFile, ImageFormat.Png);
+                result.Save(outFile, ImageFormat.Png);
 
-                    Interlocked.Increment(ref total);
-
-                    lock (consoleLock)
-                    {
-                        Console.WriteLine($"Processed: {Path.GetFileName(file)}");
-                    }
-                }
-                catch (Exception ex)
-                {
-                    lock (consoleLock)
-                    {
-                        Console.WriteLine($"Error: {file} -> {ex.Message}");
-                    }
-                }
-            });
+                total++;
+                Console.WriteLine($"Processed: {Path.GetFileName(file)}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error: {file} -> {ex.Message}");
+            }
+        }
 
         swTotal.Stop();
 
@@ -178,112 +122,6 @@ class Program
         Console.WriteLine($"Time   : {swTotal.Elapsed.TotalSeconds:F2}s");
         Console.WriteLine($"Avg    : {swTotal.Elapsed.TotalMilliseconds / total:F2} ms");
         Console.WriteLine("================================");
-    }
-
-    // ------------------------------------------------------------
-    //  MANUAL BENCHMARK (SEQUENTIAL)
-    // ------------------------------------------------------------
-    static void RunManualBenchmark(string[] files)
-    {
-        if (files.Length == 0)
-            throw new InvalidOperationException("No input images found.");
-
-        Console.WriteLine($"Benchmark: {files.Length} images (sequential)");
-
-        var summary = new BenchmarkSummary();
-        var swTotal = Stopwatch.StartNew();
-
-        foreach (string file in files)
-        {
-            try
-            {
-                var result = ProcessOneImage(file);
-                summary.Add(result.Timing);
-                Console.WriteLine($"Processed: {Path.GetFileName(file)} -> {result.OutputPath}");
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error: {file} -> {ex.Message}");
-            }
-        }
-
-        swTotal.Stop();
-        PrintBenchmarkSummary(BenchmarkLabel, summary, swTotal.Elapsed.TotalMilliseconds);
-    }
-
-    // ------------------------------------------------------------
-    //  SINGLE IMAGE PROCESSING (USED BY BENCHMARK)
-    // ------------------------------------------------------------
-    static ImageRunResult ProcessOneImage(string file)
-    {
-        var swImage = Stopwatch.StartNew();
-
-        using Bitmap original = new Bitmap(file);
-        using Bitmap rgb = ConvertTo24Bit(original);
-
-        float[] gray = ToGray(rgb);
-
-        gray = GpuBlur.Apply(gray, rgb.Width, rgb.Height, BlurRadius);
-        int[] labels = GraphSegmentation(gray, rgb.Width, rgb.Height);
-        int tumorLabel = BestTumorComponent(labels, gray, rgb.Width, rgb.Height);
-
-        using Bitmap result = CreateGreenOverlay(rgb, labels, tumorLabel);
-
-        string outFile = Path.Combine(
-            OutputFolderPath,
-            Path.GetFileNameWithoutExtension(file) + "_graph.png");
-
-        result.Save(outFile, ImageFormat.Png);
-
-        swImage.Stop();
-
-        double processingTime = swImage.Elapsed.TotalMilliseconds;
-        return new ImageRunResult(outFile, new FullBenchmarkTiming(processingTime, processingTime));
-    }
-
-    // ------------------------------------------------------------
-    //  BENCHMARK STATISTICS
-    // ------------------------------------------------------------
-    class BenchmarkSummary
-    {
-        public double TotalProcessingTimeMs { get; private set; }
-        public double TotalImageExecutionTimeMs { get; private set; }
-        public double MinProcessingTimeMs { get; private set; } = double.MaxValue;
-        public double MaxProcessingTimeMs { get; private set; }
-        public double MinImageExecutionTimeMs { get; private set; } = double.MaxValue;
-        public double MaxImageExecutionTimeMs { get; private set; }
-        public int Count { get; private set; }
-
-        public double AverageProcessingTimeMs => Count == 0 ? 0 : TotalProcessingTimeMs / Count;
-        public double AverageImageExecutionTimeMs => Count == 0 ? 0 : TotalImageExecutionTimeMs / Count;
-
-        public void Add(FullBenchmarkTiming timing)
-        {
-            Count++;
-            TotalProcessingTimeMs += timing.ProcessingTimeMs;
-            TotalImageExecutionTimeMs += timing.ImageExecutionTimeMs;
-            MinProcessingTimeMs = Math.Min(MinProcessingTimeMs, timing.ProcessingTimeMs);
-            MaxProcessingTimeMs = Math.Max(MaxProcessingTimeMs, timing.ProcessingTimeMs);
-            MinImageExecutionTimeMs = Math.Min(MinImageExecutionTimeMs, timing.ImageExecutionTimeMs);
-            MaxImageExecutionTimeMs = Math.Max(MaxImageExecutionTimeMs, timing.ImageExecutionTimeMs);
-        }
-    }
-
-    record struct FullBenchmarkTiming(double ProcessingTimeMs, double ImageExecutionTimeMs);
-    record struct ImageRunResult(string OutputPath, FullBenchmarkTiming Timing);
-
-    static void PrintBenchmarkSummary(string label, BenchmarkSummary summary, double executionTimeMs)
-    {
-        Console.WriteLine();
-        Console.WriteLine($"{label} benchmark:");
-        Console.WriteLine($"{label} overall processing time: {summary.TotalProcessingTimeMs:F2} ms");
-        Console.WriteLine($"{label} average processing time: {summary.AverageProcessingTimeMs:F2} ms");
-        Console.WriteLine($"{label} min processing time: {summary.MinProcessingTimeMs:F2} ms");
-        Console.WriteLine($"{label} max processing time: {summary.MaxProcessingTimeMs:F2} ms");
-        Console.WriteLine($"{label} overall execution time: {executionTimeMs:F2} ms");
-        Console.WriteLine($"{label} average execution time: {summary.AverageImageExecutionTimeMs:F2} ms");
-        Console.WriteLine($"{label} min execution time: {summary.MinImageExecutionTimeMs:F2} ms");
-        Console.WriteLine($"{label} max execution time: {summary.MaxImageExecutionTimeMs:F2} ms");
     }
 
     // ============================================================
