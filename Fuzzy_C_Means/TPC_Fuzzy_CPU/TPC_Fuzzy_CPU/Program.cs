@@ -11,8 +11,9 @@ const int MinFcmIterations = 8;
 const int MaxFcmIterations = 14;
 const float Fuzziness = 2.0f;            // Standard FCM fuzziness. Must be greater than 1.
 
-const string InputFolderPath = @"E:\TPC Preprocessing\Preprocess Dataset"; // Put the folder containing preprocessed grayscale images here.
+const string InputFolderPath = @"E:\TPC6323-Project\TPC Preprocessing\Preprocess Dataset"; // Put the folder containing preprocessed grayscale images here.
 const string OutputFolderPath = @"E:\Fuzzy_C_Means\TPC_Fuzzy_CPU\output";
+const string GroundTruthMaskFolderPath = @"E:\TPC6323-Project\Ground Truth Mask";
 const bool RunBenchmarkDotNet = false;   // Set true and click Run to execute BenchmarkDotNet instead of normal output generation.
 
 bool runOnce = args.Contains("--run-once", StringComparer.OrdinalIgnoreCase);
@@ -25,18 +26,25 @@ if ((RunBenchmarkDotNet && !runOnce) || args.Contains("--benchmark", StringCompa
 Stopwatch executionStopwatch = Stopwatch.StartNew();
 string inputFolder = ResolveInputFolder(InputFolderPath);
 string outputDir = PrepareOutputFolder(OutputFolderPath, inputFolder);
+string groundTruthFolder = ResolveGroundTruthFolder(GroundTruthMaskFolderPath);
 string[] inputPaths = FindInputImages(inputFolder);
 BenchmarkSummary benchmark = new();
+MseSummary mseSummary = new();
 
 foreach (string inputPath in inputPaths)
 {
-    ImageRunResult result = ProcessImage(inputFolder, outputDir, inputPath, RunCpuParallelFuzzyCMeans);
+    ImageRunResult result = ProcessImage(inputFolder, outputDir, groundTruthFolder, inputPath, RunCpuParallelFuzzyCMeans);
     benchmark.Add(result.Timing);
+    mseSummary.Add(result.Mse);
     Console.WriteLine("Output: " + result.OutputPath);
+    Console.WriteLine(result.Mse.HasValue
+        ? $"MSE: {result.Mse.Value:F2}"
+        : "MSE: skipped (matching ground truth mask not found)");
 }
 
 executionStopwatch.Stop();
 PrintBenchmark("CPU", benchmark, executionStopwatch.Elapsed.TotalMilliseconds);
+PrintMseSummary("CPU FCM", mseSummary);
 
 static string ResolveInputFolder(string inputFolderPath)
 {
@@ -57,6 +65,18 @@ static string PrepareOutputFolder(string outputFolderPath, string inputFolder)
         : Path.GetFullPath(outputFolderPath);
     Directory.CreateDirectory(outputDir);
     return outputDir;
+}
+
+static string ResolveGroundTruthFolder(string groundTruthFolderPath)
+{
+    if (string.IsNullOrWhiteSpace(groundTruthFolderPath))
+        throw new ArgumentException("Please set GroundTruthMaskFolderPath in Program.cs.");
+
+    string groundTruthFolder = Path.GetFullPath(groundTruthFolderPath);
+    if (!Directory.Exists(groundTruthFolder))
+        throw new DirectoryNotFoundException("Ground truth mask folder was not found: " + groundTruthFolder);
+
+    return groundTruthFolder;
 }
 
 static string[] FindInputImages(string inputFolder)
@@ -84,6 +104,7 @@ static ImageData LoadAndReportImage(string inputPath)
 static ImageRunResult ProcessImage(
     string inputFolder,
     string outputDir,
+    string groundTruthFolder,
     string inputPath,
     Func<ImageData, int[]> runSegmentation)
 {
@@ -97,12 +118,14 @@ static ImageRunResult ProcessImage(
 
     string outputPath = SaveTumorCandidateOutput(inputFolder, outputDir, inputPath, image, tumorMask);
     imageExecutionStopwatch.Stop();
+    double? mse = EvaluateMseAgainstGroundTruth(inputFolder, groundTruthFolder, inputPath, image, tumorMask);
 
     return new ImageRunResult(
         outputPath,
         new FullBenchmarkTiming(
             processingStopwatch.Elapsed.TotalMilliseconds,
-            imageExecutionStopwatch.Elapsed.TotalMilliseconds));
+            imageExecutionStopwatch.Elapsed.TotalMilliseconds),
+        mse);
 }
 
 static string SaveTumorCandidateOutput(
@@ -135,6 +158,19 @@ static void PrintBenchmark(string label, BenchmarkSummary benchmark, double exec
     Console.WriteLine($"{label} FCM average execution time: {benchmark.AverageImageExecutionTimeMs:F2} ms");
     Console.WriteLine($"{label} FCM min execution time: {benchmark.MinImageExecutionTimeMs:F2} ms");
     Console.WriteLine($"{label} FCM max execution time: {benchmark.MaxImageExecutionTimeMs:F2} ms");
+}
+
+static void PrintMseSummary(string label, MseSummary summary)
+{
+    Console.WriteLine($"{label} MSE evaluation:");
+    Console.WriteLine($"{label} MSE matched images: {summary.Count}");
+    Console.WriteLine($"{label} MSE skipped images: {summary.Skipped}");
+    if (summary.Count == 0)
+        return;
+
+    Console.WriteLine($"{label} MSE average: {summary.Average:F2}");
+    Console.WriteLine($"{label} MSE min: {summary.Min:F2}");
+    Console.WriteLine($"{label} MSE max: {summary.Max:F2}");
 }
 
 static bool IsSupportedImage(string path)
@@ -177,6 +213,85 @@ static ImageData LoadPreprocessedImage(string path)
 
     bitmap.UnlockBits(data);
     return new ImageData(w, h, r, g, b, gray);
+}
+
+static double? EvaluateMseAgainstGroundTruth(
+    string inputFolder,
+    string groundTruthFolder,
+    string inputPath,
+    ImageData image,
+    bool[] predictedMask)
+{
+    string? groundTruthPath = FindGroundTruthMaskPath(inputFolder, groundTruthFolder, inputPath);
+    if (groundTruthPath is null)
+        return null;
+
+    return CalculateMse(predictedMask, image.Width, image.Height, groundTruthPath);
+}
+
+static string? FindGroundTruthMaskPath(string inputFolder, string groundTruthFolder, string inputPath)
+{
+    string relativeFolder = Path.GetDirectoryName(Path.GetRelativePath(inputFolder, inputPath)) ?? "";
+    string maskFolder = Path.Combine(groundTruthFolder, relativeFolder);
+    if (!Directory.Exists(maskFolder))
+        return null;
+
+    string stem = Path.GetFileNameWithoutExtension(inputPath);
+    if (stem.EndsWith("_gray", StringComparison.OrdinalIgnoreCase))
+        stem = stem[..^"_gray".Length];
+
+    string[] candidateNames =
+    {
+        stem + "_gradcam",
+        stem + "_mask",
+        stem
+    };
+
+    string[] extensions = { ".png", ".jpg", ".jpeg", ".bmp" };
+    foreach (string candidateName in candidateNames)
+        foreach (string extension in extensions)
+        {
+            string candidatePath = Path.Combine(maskFolder, candidateName + extension);
+            if (File.Exists(candidatePath))
+                return candidatePath;
+        }
+
+    return Directory
+        .EnumerateFiles(maskFolder, "*.*", SearchOption.TopDirectoryOnly)
+        .Where(IsSupportedImage)
+        .FirstOrDefault(path => Path.GetFileNameWithoutExtension(path).StartsWith(stem, StringComparison.OrdinalIgnoreCase));
+}
+
+static double CalculateMse(bool[] predictedMask, int width, int height, string groundTruthPath)
+{
+    using Bitmap source = new Bitmap(groundTruthPath);
+    using Bitmap groundTruth = new Bitmap(width, height, PixelFormat.Format24bppRgb);
+    using (Graphics graphics = Graphics.FromImage(groundTruth))
+        graphics.DrawImage(source, new Rectangle(0, 0, width, height));
+
+    BitmapData data = groundTruth.LockBits(new Rectangle(0, 0, width, height), ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
+    double sumSquaredError = 0;
+
+    unsafe
+    {
+        byte* ptr = (byte*)data.Scan0;
+        for (int y = 0; y < height; y++)
+        {
+            byte* row = ptr + y * data.Stride;
+            for (int x = 0; x < width; x++)
+            {
+                int i = y * width + x, p = x * 3;
+                byte b = row[p], g = row[p + 1], r = row[p + 2];
+                double groundTruthValue = 0.299 * r + 0.587 * g + 0.114 * b;
+                double predictedValue = predictedMask[i] ? 255.0 : 0.0;
+                double diff = predictedValue - groundTruthValue;
+                sumSquaredError += diff * diff;
+            }
+        }
+    }
+
+    groundTruth.UnlockBits(data);
+    return sumSquaredError / predictedMask.Length;
 }
 
 static Bitmap ConvertTo24BitRgb(Bitmap source)
@@ -773,7 +888,7 @@ static class BenchmarkProcessRunner
 }
 
 record struct FullBenchmarkTiming(double ProcessingTimeMs, double ImageExecutionTimeMs);
-record struct ImageRunResult(string OutputPath, FullBenchmarkTiming Timing);
+record struct ImageRunResult(string OutputPath, FullBenchmarkTiming Timing, double? Mse);
 
 class BenchmarkSummary
 {
@@ -797,6 +912,31 @@ class BenchmarkSummary
         MaxProcessingTimeMs = Math.Max(MaxProcessingTimeMs, timing.ProcessingTimeMs);
         MinImageExecutionTimeMs = Math.Min(MinImageExecutionTimeMs, timing.ImageExecutionTimeMs);
         MaxImageExecutionTimeMs = Math.Max(MaxImageExecutionTimeMs, timing.ImageExecutionTimeMs);
+    }
+}
+
+class MseSummary
+{
+    public double Total { get; private set; }
+    public double Min { get; private set; } = double.MaxValue;
+    public double Max { get; private set; }
+    public int Count { get; private set; }
+    public int Skipped { get; private set; }
+
+    public double Average => Count == 0 ? 0 : Total / Count;
+
+    public void Add(double? mse)
+    {
+        if (!mse.HasValue)
+        {
+            Skipped++;
+            return;
+        }
+
+        Count++;
+        Total += mse.Value;
+        Min = Math.Min(Min, mse.Value);
+        Max = Math.Max(Max, mse.Value);
     }
 }
 

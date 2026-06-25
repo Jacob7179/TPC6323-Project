@@ -1,8 +1,8 @@
 ﻿using System.Drawing;
 using System.Drawing.Imaging;
 
-const string InputFolderPath = @"C:\Users\Nitro\Downloads\Brain MRI\Brain MRI\Training"; // Put the folder containing original MRI images here.
-const string OutputFolderPath = @"E:\TPC Preprocessing\Preprocess Dataset";
+const string InputFolderPath = @"E:\TPC6323-Project\TPC Preprocessing\Dataset"; // Put the folder containing original MRI images here.
+const string OutputFolderPath = @"E:\TPC6323-Project\TPC Preprocessing\Preprocess Dataset";
 
 if (string.IsNullOrWhiteSpace(InputFolderPath))
     throw new ArgumentException("Please set InputFolderPath in Program.cs.");
