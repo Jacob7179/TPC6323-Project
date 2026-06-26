@@ -2,6 +2,8 @@
 
 ## 📋 Project Overview
 
+**Subject:** TPC6323 Parallel Computing
+
 **Title:** Parallel Image Segmentation using K-Means for Brain Tumour
 
 **Category:** Signal Processing
@@ -16,22 +18,24 @@ This project implements and compares five brain tumor segmentation algorithms (K
 - **End-to-End Pipeline:** From image preprocessing to segmentation mask generation
 - **Dataset:** Kaggle Brain Tumor MRI Dataset with glioma, pituitary, and meningioma classes
 
-## 🛠️ Technologies Used
+## 🛠️ Technology Used
 
 - **Language:** C#
 - **GPU Acceleration:** ILGPU
 - **Benchmarking:** BenchmarkDotNet
 
 ## 📊 Dataset Used
-- 
-- 
+- https://www.kaggle.com/datasets/masoudnickparvar/brain-tumor-mri-dataset
+- https://www.kaggle.com/code/noorsaeed/99-mri-classification-with-grad-cam-segmentation
 
 ## 📁 Project Structure
-
-- `Parallel GBS` - Folder for Graph Based Segmentation (CPU, GPU & Sequential)
-- 
-- 
-- 
+```
+TPC6323-Project/
+│
+├── 
+│
+└──
+```
 
 ## 👥 Contributors
 
