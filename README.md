@@ -37,25 +37,25 @@ The datasets include MRI scans of:
 ```
 TPC6323-Project/
 │
-├── SLIC/                                               # SLIC Superpixels segmentation
-│   ├── Benchmark-focusOnAlgOnly/                       # BenchmarkDotNet performance evaluation (CPU, GPU, Sequential & Prototype)
-│   ├── Dataset/                                        # Brain MRI datasetssegmentation (glioma, meningioma & pituitary)
-│   ├── Grad-CAM-based pseudo ground truth/             # Pseudo ground truth generated using Grad-CAM (glioma, meningioma & pituitary)
-│   ├── Parallel Slic (Full Benchmark Check)/           # Parallel SLIC (CPU & GPU)
-│   ├── Prototype/K-Means-GPU                           # Prototype
-│   └── TPC Preprocessing/                              # Image preprocessing utilities (Dataset, Preprocess Dataset & Preprocessing Code)
+├── SLIC/                                       # SLIC Superpixels segmentation
+│   ├── Benchmark-focusOnAlgOnly/               # BenchmarkDotNet performance evaluation (CPU, GPU, Sequential & Prototype)
+│   ├── Dataset/                                # Brain MRI datasetssegmentation (glioma, meningioma & pituitary)
+│   ├── Grad-CAM-based pseudo ground truth/     # Pseudo ground truth generated using Grad-CAM (glioma, meningioma & pituitary)
+│   ├── Parallel Slic (Full Benchmark Check)/   # Parallel SLIC (CPU & GPU)
+│   ├── Prototype/K-Means-GPU                   # Prototype (K-Means)
+│   └── TPC Preprocessing/                      # Image preprocessing utilities (Dataset, Preprocess Dataset & Preprocessing Code)
 │
-├── Fuzzy_C_Means/                                      # Fuzzy C-Means  
-│   ├── TPC_Fuzzy_CPU                                   # CPU Parallel
-│   └── TPC_Fuzzy_GPU                                   # GPU Parallel 
+├── Fuzzy_C_Means/                              # Fuzzy C-Means  
+│   ├── TPC_Fuzzy_CPU                           # CPU Parallel
+│   └── TPC_Fuzzy_GPU                           # GPU Parallel 
 │
-├── GBS                                                 # Graph-Based Segmentation
-│   ├── backup/                                         # Backup source codes
-│   ├── GBS_CPU/                                        # CPU Parallel
-│   ├── GBS_GPU/                                        # GPU Parallel implementation (ILGPU)
-│   └── Sequential GBS/                                 # Sequential
+├── GBS/                                        # Graph-Based Segmentation
+│   ├── backup/                                 # Backup source codes
+│   ├── GBS_CPU/                                # CPU Parallel
+│   ├── GBS_GPU/                                # GPU Parallel implementation (ILGPU)
+│   └── Sequential GBS/                         # Sequential (old)
 │
-└──
+└── K-Means/
 ```
 
 ## 👥 Contributors
