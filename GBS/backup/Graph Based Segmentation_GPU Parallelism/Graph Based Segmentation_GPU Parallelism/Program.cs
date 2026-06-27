@@ -24,7 +24,11 @@ class Program
 
     // ===================================================
 
-    static void Main(string[] args)
+    // Thread‑safe locks
+    private static readonly object consoleLock = new object();
+    private static readonly object mseLock = new object();
+
+    static void Main()
     {
         Directory.CreateDirectory(OutputFolderPath);
 
@@ -40,7 +44,7 @@ class Program
             Path.Combine(inputFolder, "meningioma")
         };
 
-        var random = new Random(42); // fixed seed for reproducibility
+        var random = new Random(42);
 
         string[] glioma = Directory.GetFiles(targetFolders[0], "*", SearchOption.AllDirectories)
             .Where(IsSupportedImage)
@@ -67,30 +71,34 @@ class Program
 
         Console.WriteLine($"Balanced dataset size: {files.Length}");
 
-        // Resolve ground truth folder
         string groundTruthFolder = ResolveGroundTruthFolder(GroundTruthMaskFolderPath);
 
         // --------------------------------------------------
-        // SEQUENTIAL PROCESSING
+        // PARALLEL PROCESSING (with GPU blur)
         // --------------------------------------------------
-        RunSequentialProcessing(files, groundTruthFolder);
+        RunParallelProcessing(files, groundTruthFolder);
     }
 
     // ------------------------------------------------------------
-    //  SEQUENTIAL PROCESSING
+    //  PARALLEL PROCESSING
     // ------------------------------------------------------------
-    static void RunSequentialProcessing(string[] files, string groundTruthFolder)
+    static void RunParallelProcessing(string[] files, string groundTruthFolder)
     {
         if (files.Length == 0)
             throw new InvalidOperationException("No input images found.");
 
-        Console.WriteLine($"Processing {files.Length} images sequentially...");
+        Console.WriteLine($"Processing {files.Length} images in parallel (GPU blur) ...");
         Stopwatch swTotal = Stopwatch.StartNew();
 
-        int total = 0;
+        int processed = 0;
         var mseSummary = new MseSummary();
 
-        foreach (string file in files)
+        var parallelOptions = new ParallelOptions
+        {
+            MaxDegreeOfParallelism = Environment.ProcessorCount // adjust as needed
+        };
+
+        Parallel.ForEach(files, parallelOptions, file =>
         {
             try
             {
@@ -98,7 +106,7 @@ class Program
                 using Bitmap rgb = ConvertTo24Bit(original);
 
                 float[] gray = ToGray(rgb);
-                gray = GpuBlur.Apply(gray, rgb.Width, rgb.Height, BlurRadius);
+                gray = GpuBlur.Apply(gray, rgb.Width, rgb.Height, BlurRadius); // GPU accelerated
                 int[] labels = GraphSegmentation(gray, rgb.Width, rgb.Height);
                 int tumorLabel = BestTumorComponent(labels, gray, rgb.Width, rgb.Height);
 
@@ -107,13 +115,15 @@ class Program
                 string outFile = Path.Combine(
                     OutputFolderPath,
                     Path.GetFileNameWithoutExtension(file) + "_graph.png");
-
                 result.Save(outFile, ImageFormat.Png);
 
-                total++;
-                Console.WriteLine($"Processed: {Path.GetFileName(file)}");
+                int current = Interlocked.Increment(ref processed);
+                lock (consoleLock)
+                {
+                    Console.WriteLine($"Processed: {Path.GetFileName(file)} ({current}/{files.Length})");
+                }
 
-                // ----- MSE Evaluation -----
+                // ----- MSE Evaluation (thread‑safe) -----
                 bool[] predictedMask = new bool[gray.Length];
                 for (int i = 0; i < gray.Length; i++)
                     predictedMask[i] = (labels[i] == tumorLabel);
@@ -126,27 +136,36 @@ class Program
                     rgb.Height,
                     predictedMask);
 
-                mseSummary.Add(mse);
-                Console.WriteLine(mse.HasValue
-                    ? $"MSE: {mse.Value:F2}"
-                    : "MSE: skipped (matching ground truth mask not found)");
+                lock (mseLock)
+                {
+                    mseSummary.Add(mse);
+                }
+
+                lock (consoleLock)
+                {
+                    Console.WriteLine(mse.HasValue
+                        ? $"MSE: {mse.Value:F2}"
+                        : "MSE: skipped (matching ground truth mask not found)");
+                }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error: {file} -> {ex.Message}");
+                lock (consoleLock)
+                {
+                    Console.WriteLine($"Error: {file} -> {ex.Message}");
+                }
             }
-        }
+        });
 
         swTotal.Stop();
 
         Console.WriteLine();
         Console.WriteLine("================================");
-        Console.WriteLine($"Images : {total}");
-        Console.WriteLine($"Time   : {swTotal.Elapsed.TotalSeconds:F2}s");
-        Console.WriteLine($"Avg    : {swTotal.Elapsed.TotalMilliseconds / total:F2} ms");
+        Console.WriteLine($"Images processed : {processed}");
+        Console.WriteLine($"Total time       : {swTotal.Elapsed.TotalSeconds:F2}s");
+        Console.WriteLine($"Average per image: {swTotal.Elapsed.TotalMilliseconds / processed:F2} ms");
         Console.WriteLine("================================");
 
-        // Print MSE summary
         PrintMseSummary("GraphSeg", mseSummary);
     }
 
@@ -288,14 +307,39 @@ class Program
     }
 
     // ============================================================
-    //  GPU BLUR (ILGPU) — FIXED: manual clamping
+    //  GPU BLUR (ILGPU) — Thread‑local accelerator for safety
     // ============================================================
     static class GpuBlur
     {
+        // Each thread gets its own Context + Accelerator
+        private class GpuResources : IDisposable
+        {
+            public Context Context { get; }
+            public Accelerator Accelerator { get; }
+
+            public GpuResources()
+            {
+                Context = Context.CreateDefault();
+                Accelerator = Context.CreateCudaAccelerator(0);
+            }
+
+            public void Dispose()
+            {
+                Accelerator?.Dispose();
+                Context?.Dispose();
+            }
+        }
+
+        private static readonly ThreadLocal<GpuResources> _resources = new ThreadLocal<GpuResources>(
+            () => new GpuResources(),
+            trackAllValues: false
+        );
+
         public static float[] Apply(float[] input, int width, int height, int radius)
         {
-            using var context = Context.CreateDefault();
-            using var accelerator = context.CreateCudaAccelerator(0);
+            // Get the accelerator for the current thread
+            var resources = _resources.Value;
+            var accelerator = resources.Accelerator;
 
             float[] kernel = BuildGaussianKernel(radius);
             using var kernelDev = accelerator.Allocate1D(kernel);

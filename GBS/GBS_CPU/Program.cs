@@ -5,6 +5,8 @@ using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 
 class Program
 {
@@ -18,6 +20,10 @@ class Program
     const int BlurRadius = 2;
 
     // ===================================================
+
+    // Thread‑safe locks
+    private static readonly object consoleLock = new object();
+    private static readonly object mseLock = new object();
 
     static void Main()
     {
@@ -66,26 +72,32 @@ class Program
         string groundTruthFolder = ResolveGroundTruthFolder(GroundTruthMaskFolderPath);
 
         // --------------------------------------------------
-        // SEQUENTIAL PROCESSING
+        // PARALLEL PROCESSING
         // --------------------------------------------------
-        RunSequentialProcessing(files, groundTruthFolder);
+        RunParallelProcessing(files, groundTruthFolder);
     }
 
     // ------------------------------------------------------------
-    //  SEQUENTIAL PROCESSING
+    //  PARALLEL PROCESSING
     // ------------------------------------------------------------
-    static void RunSequentialProcessing(string[] files, string groundTruthFolder)
+    static void RunParallelProcessing(string[] files, string groundTruthFolder)
     {
         if (files.Length == 0)
             throw new InvalidOperationException("No input images found.");
 
-        Console.WriteLine($"Processing {files.Length} images sequentially...");
+        Console.WriteLine($"Processing {files.Length} images in parallel...");
         Stopwatch swTotal = Stopwatch.StartNew();
 
         int processed = 0;
         var mseSummary = new MseSummary();
 
-        foreach (string file in files)
+        // Configure parallelism – you can change MaxDegreeOfParallelism
+        var parallelOptions = new ParallelOptions
+        {
+            MaxDegreeOfParallelism = Environment.ProcessorCount // or a fixed number like 4
+        };
+
+        Parallel.ForEach(files, parallelOptions, file =>
         {
             try
             {
@@ -105,10 +117,13 @@ class Program
                     Path.GetFileNameWithoutExtension(file) + "_graph.png");
                 result.Save(outFile, ImageFormat.Png);
 
-                processed++;
-                Console.WriteLine($"Processed: {Path.GetFileName(file)} ({processed}/{files.Length})");
+                int current = Interlocked.Increment(ref processed);
+                lock (consoleLock)
+                {
+                    Console.WriteLine($"Processed: {Path.GetFileName(file)} ({current}/{files.Length})");
+                }
 
-                // ----- MSE Evaluation -----
+                // ----- MSE Evaluation (thread‑safe) -----
                 bool[] predictedMask = new bool[gray.Length];
                 for (int i = 0; i < gray.Length; i++)
                     predictedMask[i] = (labels[i] == tumorLabel);
@@ -121,16 +136,26 @@ class Program
                     rgb.Height,
                     predictedMask);
 
-                mseSummary.Add(mse);
-                Console.WriteLine(mse.HasValue
-                    ? $"MSE: {mse.Value:F2}"
-                    : "MSE: skipped (matching ground truth mask not found)");
+                lock (mseLock)
+                {
+                    mseSummary.Add(mse);
+                }
+
+                lock (consoleLock)
+                {
+                    Console.WriteLine(mse.HasValue
+                        ? $"MSE: {mse.Value:F2}"
+                        : "MSE: skipped (matching ground truth mask not found)");
+                }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error: {file} -> {ex.Message}");
+                lock (consoleLock)
+                {
+                    Console.WriteLine($"Error: {file} -> {ex.Message}");
+                }
             }
-        }
+        });
 
         swTotal.Stop();
 
@@ -146,7 +171,7 @@ class Program
     }
 
     // ============================================================
-    //  MSE EVALUATION FUNCTIONS
+    //  MSE EVALUATION FUNCTIONS (unchanged)
     // ============================================================
     static string ResolveGroundTruthFolder(string groundTruthFolderPath)
     {
@@ -407,7 +432,7 @@ class Program
     }
 
     // ============================================================
-    //  TUMOR COMPONENT SELECTION
+    //  TUMOR COMPONENT SELECTION (unchanged)
     // ============================================================
     static int BestTumorComponent(int[] labels, float[] gray, int width, int height)
     {
@@ -527,7 +552,7 @@ class Program
     }
 
     // ============================================================
-    //  IMAGE UTILITIES
+    //  IMAGE UTILITIES (unchanged)
     // ============================================================
     static bool IsSupportedImage(string path)
     {
