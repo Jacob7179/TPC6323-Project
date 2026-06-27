@@ -1,0 +1,300 @@
+// GPU Mean Shift (ILGPU Parallel Version)
+
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Diagnostics;
+
+using ILGPU;
+using ILGPU.Runtime;
+
+namespace MeanShiftMRI
+{
+    class Program
+    {
+        const string BaseFolderPath = @"C:\Users\user\Downloads\Brain MRI\Training";
+        const string OutputFolderPath = @"C:\Users\user\Downloads\Segmented Output";
+
+        // =========================
+        // GPU KERNEL
+        // =========================
+        static void MeanShiftKernel(
+            Index1D index,
+
+            ArrayView<float> xs,
+            ArrayView<float> ys,
+            ArrayView<float> ints,
+
+            ArrayView<float> outX,
+            ArrayView<float> outY,
+            ArrayView<float> outI,
+
+            float bandwidth2)
+        {
+            int seed = index * 5;
+
+            if (seed >= xs.Length)
+                return;
+
+            float meanX = xs[seed];
+            float meanY = ys[seed];
+            float meanI = ints[seed];
+
+            for (int iter = 0; iter < 10; iter++)
+            {
+                float sumX = 0;
+                float sumY = 0;
+                float sumI = 0;
+                int count = 0;
+
+                for (int j = 0; j < xs.Length; j++)
+                {
+                    float dx = meanX - xs[j];
+                    float dy = meanY - ys[j];
+                    float di = meanI - ints[j];
+
+                    float dist2 = dx * dx + dy * dy + di * di;
+
+                    if (dist2 <= bandwidth2)
+                    {
+                        sumX += xs[j];
+                        sumY += ys[j];
+                        sumI += ints[j];
+                        count++;
+                    }
+                }
+
+                if (count == 0)
+                    break;
+
+                float newX = sumX / count;
+                float newY = sumY / count;
+                float newI = sumI / count;
+
+                float shift =
+                    (newX - meanX) * (newX - meanX) +
+                    (newY - meanY) * (newY - meanY) +
+                    (newI - meanI) * (newI - meanI);
+
+                meanX = newX;
+                meanY = newY;
+                meanI = newI;
+
+                if (shift < 0.001f)
+                    break;
+            }
+
+            outX[index] = meanX;
+            outY[index] = meanY;
+            outI[index] = meanI;
+        }
+
+        // =========================
+        // MAIN
+        // =========================
+        static void Main(string[] args)
+        {
+            using Context context = Context.CreateDefault();
+
+            using Accelerator accelerator =
+                context.GetPreferredDevice(preferCPU: false)
+                       .CreateAccelerator(context);
+
+            Console.WriteLine($"GPU: {accelerator.Name}");
+
+            Directory.CreateDirectory(OutputFolderPath);
+
+            string inputFolder = Path.GetFullPath(BaseFolderPath);
+
+            string[] targetFolders = new[]
+            {
+                Path.Combine(inputFolder, "glioma"),
+                Path.Combine(inputFolder, "pituitary"),
+                Path.Combine(inputFolder, "meningioma")
+            };
+
+            var random = new Random(42);
+
+            // =========================
+            // BALANCED SAMPLING (33/33/34)
+            // =========================
+            string[] glioma = Directory.GetFiles(targetFolders[0])
+                .Where(IsSupportedImage)
+                .OrderBy(_ => random.Next())
+                .Take(33)
+                .ToArray();
+
+            string[] pituitary = Directory.GetFiles(targetFolders[1])
+                .Where(IsSupportedImage)
+                .OrderBy(_ => random.Next())
+                .Take(33)
+                .ToArray();
+
+            string[] meningioma = Directory.GetFiles(targetFolders[2])
+                .Where(IsSupportedImage)
+                .OrderBy(_ => random.Next())
+                .Take(34)
+                .ToArray();
+
+            // merge final dataset
+            string[] files = glioma
+                .Concat(pituitary)
+                .Concat(meningioma)
+                .ToArray();
+
+            Console.WriteLine($"Glioma: {glioma.Length}");
+            Console.WriteLine($"Pituitary: {pituitary.Length}");
+            Console.WriteLine($"Meningioma: {meningioma.Length}");
+            Console.WriteLine($"TOTAL dataset size: {files.Length}");
+
+            var kernel = accelerator.LoadAutoGroupedStreamKernel<
+                Index1D,
+                ArrayView<float>,
+                ArrayView<float>,
+                ArrayView<float>,
+                ArrayView<float>,
+                ArrayView<float>,
+                ArrayView<float>,
+                float>(MeanShiftKernel);
+
+            var totalWatch = Stopwatch.StartNew();
+
+            foreach (var file in files)
+            {
+                Console.WriteLine($"\nProcessing: {Path.GetFileName(file)}");
+
+                var pixels = LoadImageFast(file);
+
+                ConvertPoints(pixels,
+                    out float[] xs,
+                    out float[] ys,
+                    out float[] ints);
+
+                int n = xs.Length;
+                int seeds = n / 5;
+
+                using var dXs = accelerator.Allocate1D(xs);
+                using var dYs = accelerator.Allocate1D(ys);
+                using var dInts = accelerator.Allocate1D(ints);
+
+                using var dOutX = accelerator.Allocate1D<float>(seeds);
+                using var dOutY = accelerator.Allocate1D<float>(seeds);
+                using var dOutI = accelerator.Allocate1D<float>(seeds);
+
+                var sw = Stopwatch.StartNew();
+
+                kernel(
+                    seeds,
+                    dXs.View,
+                    dYs.View,
+                    dInts.View,
+                    dOutX.View,
+                    dOutY.View,
+                    dOutI.View,
+                    25f * 25f);
+
+                accelerator.Synchronize();
+
+                float[] cx = dOutX.GetAsArray1D();
+                float[] cy = dOutY.GetAsArray1D();
+                float[] ci = dOutI.GetAsArray1D();
+
+                sw.Stop();
+
+                Console.WriteLine($"Clusters: {seeds}");
+                Console.WriteLine($"Time (end-to-end): {sw.ElapsedMilliseconds} ms");
+            }
+
+            totalWatch.Stop();
+
+            Console.WriteLine($"\nTOTAL PIPELINE TIME: {totalWatch.Elapsed.TotalSeconds:F2} seconds");
+        }
+
+        // =========================
+        // IMAGE LOADER (UNCHANGED)
+        // =========================
+        static List<Point> LoadImageFast(string path)
+        {
+            Bitmap bmp = new Bitmap(path);
+
+            var rect = new Rectangle(0, 0, bmp.Width, bmp.Height);
+            BitmapData data = bmp.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
+
+            int stride = data.Stride;
+            IntPtr scan0 = data.Scan0;
+
+            byte[] buffer = new byte[stride * bmp.Height];
+            Marshal.Copy(scan0, buffer, 0, buffer.Length);
+
+            List<Point> points = new List<Point>();
+
+            for (int y = 0; y < bmp.Height; y += 2)
+            {
+                for (int x = 0; x < bmp.Width; x += 2)
+                {
+                    int idx = (y * stride) + (x * 3);
+
+                    byte b = buffer[idx];
+                    byte g = buffer[idx + 1];
+                    byte r = buffer[idx + 2];
+
+                    float intensity = (r + g + b) / 3f;
+
+                    points.Add(new Point(new double[]
+                    {
+                        x,
+                        y,
+                        intensity
+                    }));
+                }
+            }
+
+            bmp.UnlockBits(data);
+            bmp.Dispose();
+
+            return points;
+        }
+
+        static bool IsSupportedImage(string file)
+        {
+            string ext = Path.GetExtension(file).ToLowerInvariant();
+
+            return ext == ".jpg"
+                || ext == ".jpeg"
+                || ext == ".png"
+                || ext == ".bmp";
+        }
+
+        static void ConvertPoints(
+            List<Point> points,
+            out float[] xs,
+            out float[] ys,
+            out float[] ints)
+        {
+            xs = new float[points.Count];
+            ys = new float[points.Count];
+            ints = new float[points.Count];
+
+            for (int i = 0; i < points.Count; i++)
+            {
+                xs[i] = (float)points[i].Features[0];
+                ys[i] = (float)points[i].Features[1];
+                ints[i] = (float)points[i].Features[2];
+            }
+        }
+
+        public class Point
+        {
+            public double[] Features;
+
+            public Point(double[] features)
+            {
+                Features = features;
+            }
+        }
+    }
+}
