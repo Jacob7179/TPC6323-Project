@@ -1,4 +1,4 @@
-﻿using System.Drawing;
+using System.Drawing;
 using System.Drawing.Imaging;
 using System.Diagnostics;
 using ILGPU;
@@ -9,9 +9,9 @@ using BenchmarkDotNet.Attributes;
 using BenchmarkDotNet.Running;
 
 // SLIC and tumor-candidate settings are chosen automatically per image below.
-const string InputFolderPath = @"E:\TPC6323-Project\TPC Preprocessing\Preprocess Dataset"; // Put the folder containing preprocessed grayscale images here.
-const string OutputFolderPath = @"E:\TPC_SLIC\Parallel Slic (Full Benchmark Check)\SLIC_GPU\output";
-const string GroundTruthMaskFolderPath = @"E:\TPC6323-Project\Ground Truth Mask";
+const string InputFolderPath = @"C:\Users\Nitro\Downloads\TPC6323-Project-main\TPC6323-Project-main\SLIC\TPC Preprocessing\Preprocess Dataset"; // Put the folder containing preprocessed grayscale images here.
+const string OutputFolderPath = @"C:\Users\Nitro\Downloads\TPC6323-Project-main\TPC6323-Project-main\SLIC\Parallel Slic (Full Benchmark Check)\SLIC_GPU\output";
+const string GroundTruthMaskFolderPath = @"C:\Users\Nitro\Downloads\TPC6323-Project-main\TPC6323-Project-main\SLIC\Grad-CAM-based pseudo ground truth";
 const bool RunBenchmarkDotNet = false; // Set true and click Run to execute BenchmarkDotNet instead of normal output generation.
 
 bool runOnce = args.Contains("--run-once", StringComparer.OrdinalIgnoreCase);
@@ -623,11 +623,85 @@ static void CleanupCandidateRegions(bool[] mask, int w, int h, BrainInfo brain)
             q[tail++] = p;
         }
     }
+
+    KeepBestCandidateRegion(mask, w, h, brain);
+}
+
+static void KeepBestCandidateRegion(bool[] mask, int w, int h, BrainInfo brain)
+{
+    bool[] seen = new bool[mask.Length];
+    int[] q = new int[mask.Length];
+    List<int> region = new();
+    List<int> bestRegion = new();
+    float bestScore = float.MinValue;
+
+    for (int start = 0; start < mask.Length; start++)
+    {
+        if (!mask[start] || seen[start])
+            continue;
+
+        region.Clear();
+        int head = 0, tail = 0, boundaryTouches = 0;
+        float sumY = 0;
+        q[tail++] = start;
+        seen[start] = true;
+
+        while (head < tail)
+        {
+            int p = q[head++];
+            int x = p % w, y = p / w;
+            region.Add(p);
+            sumY += y;
+            if (!InsideBrainRoi(x, y, brain) || x <= brain.RoiLeft || x >= brain.RoiRight || y <= brain.RoiTop || y >= brain.RoiBottom)
+                boundaryTouches++;
+            Add(p - 1, x > 0);
+            Add(p + 1, x < w - 1);
+            Add(p - w, y > 0);
+            Add(p + w, y < h - 1);
+        }
+
+        float boundaryRatio = boundaryTouches / (float)region.Count;
+        float centerYRatio = (sumY / region.Count) / h;
+        float lowerRegionPenalty = Math.Max(0f, centerYRatio - 0.62f) * region.Count * 1.8f;
+        float score = region.Count * (1f - boundaryRatio) - lowerRegionPenalty;
+
+        if (score > bestScore)
+        {
+            bestScore = score;
+            bestRegion = new List<int>(region);
+        }
+
+        void Add(int p, bool inside)
+        {
+            if (!inside || seen[p] || !mask[p])
+                return;
+            seen[p] = true;
+            q[tail++] = p;
+        }
+    }
+
+    Array.Fill(mask, false);
+    foreach (int p in bestRegion)
+        mask[p] = true;
 }
 
 static bool InsideBrainRoi(int x, int y, BrainInfo brain)
 {
-    return x >= brain.RoiLeft && x <= brain.RoiRight && y >= brain.RoiTop && y <= brain.RoiBottom;
+    if (x < brain.RoiLeft || x > brain.RoiRight || y < brain.RoiTop || y > brain.RoiBottom)
+        return false;
+
+    float roiWidth = Math.Max(1f, brain.RoiRight - brain.RoiLeft + 1f);
+    float roiHeight = Math.Max(1f, brain.RoiBottom - brain.RoiTop + 1f);
+    float centerX = brain.RoiLeft + roiWidth * 0.48f;
+    float centerY = brain.RoiTop + roiHeight * 0.46f;
+    float radiusX = roiWidth * 0.52f;
+    float radiusY = roiHeight * 0.50f;
+    float dx = x - centerX;
+    float dy = y - centerY;
+    bool insideCranialArea = y <= brain.RoiTop + roiHeight * 0.84f &&
+                             (dx * dx / (radiusX * radiusX) + dy * dy / (radiusY * radiusY)) <= 1.08f;
+
+    return insideCranialArea;
 }
 
 static void SaveTumorOverlay(string path, ImageData image, bool[] mask)

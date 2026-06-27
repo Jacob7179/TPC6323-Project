@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -14,6 +14,10 @@ class Program
     const string BaseFolderPath = @"C:\BrainTumorDataset\Testing\Dataset";
     const string OutputFolderPath = @"C:\BrainTumorDataset\Testing\GraphSegmented";
     const string GroundTruthMaskFolderPath = @"C:\BrainTumorDataset\Testing\Ground Truth Mask";
+    const int MinBrainRoiPixels = 100;
+    const float MinCandidateComponentRatio = 0.00035f;
+    const float MaxCandidateComponentRatio = 0.18f;
+    const float MaxBrainBoundaryTouchRatio = 0.10f;
 
     const float K = 300f;
     const int MinSize = 100;
@@ -110,7 +114,8 @@ class Program
                 int[] labels = GraphSegmentation(gray, rgb.Width, rgb.Height);
                 int tumorLabel = BestTumorComponent(labels, gray, rgb.Width, rgb.Height);
 
-                using Bitmap result = CreateGreenOverlay(rgb, labels, tumorLabel);
+                bool[] tumorMask = BuildSingleLabelCandidateMask(labels, tumorLabel, gray, rgb.Width, rgb.Height);
+                using Bitmap result = CreateGreenOverlay(rgb, tumorMask);
 
                 string outFile = Path.Combine(
                     OutputFolderPath,
@@ -551,6 +556,510 @@ class Program
         return scores.OrderByDescending(s => s.score).First().label;
     }
 
+    static bool[] BuildBrainRoiMask(float[] gray, int w, int h)
+    {
+        bool[] foreground = ThresholdForeground(gray);
+        foreground = CloseMask(foreground, w, h, 2);
+        foreground = KeepLargestComponent(foreground, w, h);
+        FillHolesInPlace(foreground, w, h);
+        ApplyCranialPriorMask(foreground, w, h);
+
+        int erosionRadius = Math.Clamp(Math.Min(w, h) / 38, 8, 18);
+        bool[] eroded = ErodeMask(foreground, w, h, erosionRadius);
+        eroded = KeepLargestComponent(eroded, w, h);
+        if (CountMask(eroded) >= MinBrainRoiPixels)
+            return eroded;
+
+        int fallbackRadius = Math.Clamp(Math.Min(w, h) / 55, 5, 12);
+        bool[] fallback = ErodeMask(foreground, w, h, fallbackRadius);
+        fallback = KeepLargestComponent(fallback, w, h);
+        return CountMask(fallback) >= MinBrainRoiPixels ? fallback : new bool[w * h];
+    }
+
+    static bool[] ThresholdForeground(float[] gray)
+    {
+        float threshold = Math.Clamp(EstimateForegroundThreshold(gray) * 0.35f, 6f, 45f);
+        bool[] mask = new bool[gray.Length];
+
+        for (int i = 0; i < gray.Length; i++)
+            mask[i] = gray[i] > threshold;
+
+        return mask;
+    }
+
+    static int EstimateForegroundThreshold(float[] gray)
+    {
+        int[] histogram = new int[256];
+        foreach (float value in gray)
+        {
+            int bucket = Math.Clamp((int)MathF.Round(value), 0, 255);
+            histogram[bucket]++;
+        }
+
+        long total = gray.Length;
+        double sum = 0;
+        for (int i = 0; i < histogram.Length; i++)
+            sum += i * histogram[i];
+
+        long backgroundWeight = 0;
+        double backgroundSum = 0;
+        double bestVariance = 0;
+        int bestThreshold = 0;
+
+        for (int threshold = 0; threshold < histogram.Length; threshold++)
+        {
+            backgroundWeight += histogram[threshold];
+            if (backgroundWeight == 0)
+                continue;
+
+            long foregroundWeight = total - backgroundWeight;
+            if (foregroundWeight == 0)
+                break;
+
+            backgroundSum += threshold * histogram[threshold];
+            double backgroundMean = backgroundSum / backgroundWeight;
+            double foregroundMean = (sum - backgroundSum) / foregroundWeight;
+            double difference = backgroundMean - foregroundMean;
+            double variance = (double)backgroundWeight * foregroundWeight * difference * difference;
+
+            if (variance > bestVariance)
+            {
+                bestVariance = variance;
+                bestThreshold = threshold;
+            }
+        }
+
+        return bestThreshold;
+    }
+
+    static void ApplyCranialPriorMask(bool[] mask, int w, int h)
+    {
+        float centerX = w * 0.45f;
+        float centerY = h * 0.44f;
+        float radiusX = w * 0.41f;
+        float radiusY = h * 0.39f;
+        float radiusX2 = radiusX * radiusX;
+        float radiusY2 = radiusY * radiusY;
+        int lowerLimit = (int)(h * 0.78f);
+
+        for (int y = 0; y < h; y++)
+        {
+            for (int x = 0; x < w; x++)
+            {
+                int index = y * w + x;
+                if (!mask[index])
+                    continue;
+
+                float dx = x - centerX;
+                float dy = y - centerY;
+                bool insideCranialArea = y <= lowerLimit && (dx * dx / radiusX2 + dy * dy / radiusY2) <= 1f;
+                if (!insideCranialArea)
+                    mask[index] = false;
+            }
+        }
+    }
+
+    static bool[] BuildTumorCandidateMask(int[] labels, float[] centroids, bool[] brainMask, int w, int h)
+    {
+        int tumorCluster = FindTumorClusterInBrainRoi(labels, centroids, brainMask, w, h);
+        bool[] rawCandidate = new bool[w * h];
+        if (tumorCluster < 0)
+            return rawCandidate;
+
+        for (int i = 0; i < rawCandidate.Length; i++)
+            rawCandidate[i] = brainMask[i] && labels[i] == tumorCluster;
+
+        return CleanCandidateComponents(rawCandidate, brainMask, w, h);
+    }
+
+    static bool[] BuildSingleLabelCandidateMask(int[] labels, int tumorLabel, float[] gray, int w, int h)
+    {
+        bool[] brainMask = BuildBrainRoiMask(gray, w, h);
+        bool[] rawCandidate = new bool[w * h];
+
+        for (int i = 0; i < rawCandidate.Length; i++)
+            rawCandidate[i] = brainMask[i] && labels[i] == tumorLabel;
+
+        return CleanCandidateComponents(rawCandidate, brainMask, w, h);
+    }
+
+    static int FindTumorClusterInBrainRoi(int[] labels, float[] centroids, bool[] brainMask, int w, int h)
+    {
+        int k = centroids.Length;
+        int[] counts = new int[k];
+        int[] boundaryCounts = new int[k];
+        int roiCount = 0;
+
+        for (int i = 0; i < labels.Length; i++)
+        {
+            if (!brainMask[i])
+                continue;
+
+            roiCount++;
+            int label = labels[i];
+            if (label < 0 || label >= k)
+                continue;
+
+            counts[label]++;
+            if (IsBrainBoundaryPixel(brainMask, w, h, i))
+                boundaryCounts[label]++;
+        }
+
+        if (roiCount < MinBrainRoiPixels)
+            return -1;
+
+        int minClusterPixels = Math.Max(8, (int)(roiCount * 0.002f));
+        int best = -1;
+        float bestScore = float.MinValue;
+
+        for (int c = 0; c < k; c++)
+        {
+            if (counts[c] < minClusterPixels)
+                continue;
+
+            float sizeRatio = counts[c] / (float)roiCount;
+            float boundaryRatio = boundaryCounts[c] / (float)counts[c];
+            float score = centroids[c] - sizeRatio * 95f - boundaryRatio * 80f;
+
+            if (sizeRatio > 0.45f)
+                score -= 120f;
+
+            if (score > bestScore)
+            {
+                bestScore = score;
+                best = c;
+            }
+        }
+
+        return best;
+    }
+
+    static bool[] CleanCandidateComponents(bool[] candidate, bool[] brainMask, int w, int h)
+    {
+        int n = candidate.Length;
+        bool[] result = new bool[n];
+        bool[] visited = new bool[n];
+        int[] queue = new int[n];
+        int[] current = new int[n];
+        int[] bestComponent = new int[n];
+        int bestCount = 0;
+        float bestScore = float.MinValue;
+
+        int roiCount = CountMask(brainMask);
+        int minSize = Math.Max(12, (int)(roiCount * MinCandidateComponentRatio));
+        int maxSize = Math.Max(minSize + 1, (int)(roiCount * MaxCandidateComponentRatio));
+
+        for (int start = 0; start < n; start++)
+        {
+            if (!candidate[start] || visited[start])
+                continue;
+
+            int head = 0;
+            int tail = 0;
+            int count = 0;
+            int boundaryTouches = 0;
+            long sumY = 0;
+            bool touchesImageBorder = false;
+
+            queue[tail++] = start;
+            visited[start] = true;
+
+            while (head < tail)
+            {
+                int index = queue[head++];
+                current[count++] = index;
+
+                int x = index % w;
+                int y = index / w;
+                sumY += y;
+                touchesImageBorder |= x == 0 || y == 0 || x == w - 1 || y == h - 1;
+
+                if (IsBrainBoundaryPixel(brainMask, w, h, index))
+                    boundaryTouches++;
+
+                for (int dy = -1; dy <= 1; dy++)
+                {
+                    int yy = y + dy;
+                    if (yy < 0 || yy >= h)
+                        continue;
+
+                    for (int dx = -1; dx <= 1; dx++)
+                    {
+                        if (dx == 0 && dy == 0)
+                            continue;
+
+                        int xx = x + dx;
+                        if (xx < 0 || xx >= w)
+                            continue;
+
+                        int next = yy * w + xx;
+                        if (candidate[next] && !visited[next])
+                        {
+                            visited[next] = true;
+                            queue[tail++] = next;
+                        }
+                    }
+                }
+            }
+
+            float boundaryTouchRatio = boundaryTouches / (float)count;
+            bool keepComponent =
+                count >= minSize &&
+                count <= maxSize &&
+                !touchesImageBorder &&
+                boundaryTouchRatio <= MaxBrainBoundaryTouchRatio;
+
+            if (!keepComponent)
+                continue;
+
+            float centerYRatio = (sumY / (float)count) / h;
+            float lowerRegionPenalty = Math.Max(0f, centerYRatio - 0.62f) * count * 1.8f;
+            float score = count * (1f - boundaryTouchRatio) - lowerRegionPenalty;
+
+            if (score > bestScore)
+            {
+                bestScore = score;
+                bestCount = count;
+                Array.Copy(current, bestComponent, count);
+            }
+        }
+
+        for (int i = 0; i < bestCount; i++)
+            result[bestComponent[i]] = true;
+
+        return result;
+    }
+
+    static int CountMask(bool[] mask)
+    {
+        int count = 0;
+        foreach (bool value in mask)
+        {
+            if (value)
+                count++;
+        }
+
+        return count;
+    }
+
+    static bool[] CloseMask(bool[] mask, int w, int h, int radius)
+    {
+        if (radius <= 0)
+            return (bool[])mask.Clone();
+
+        return ErodeMask(DilateMask(mask, w, h, radius), w, h, radius);
+    }
+
+    static bool[] DilateMask(bool[] mask, int w, int h, int radius)
+    {
+        bool[] result = new bool[mask.Length];
+
+        for (int y = 0; y < h; y++)
+        {
+            for (int x = 0; x < w; x++)
+            {
+                bool value = false;
+
+                for (int dy = -radius; dy <= radius && !value; dy++)
+                {
+                    int yy = y + dy;
+                    if (yy < 0 || yy >= h)
+                        continue;
+
+                    for (int dx = -radius; dx <= radius; dx++)
+                    {
+                        int xx = x + dx;
+                        if (xx < 0 || xx >= w)
+                            continue;
+
+                        if (mask[yy * w + xx])
+                        {
+                            value = true;
+                            break;
+                        }
+                    }
+                }
+
+                result[y * w + x] = value;
+            }
+        }
+
+        return result;
+    }
+
+    static bool[] ErodeMask(bool[] mask, int w, int h, int radius)
+    {
+        if (radius <= 0)
+            return (bool[])mask.Clone();
+
+        bool[] result = new bool[mask.Length];
+
+        for (int y = 0; y < h; y++)
+        {
+            for (int x = 0; x < w; x++)
+            {
+                bool keep = true;
+
+                for (int dy = -radius; dy <= radius && keep; dy++)
+                {
+                    int yy = y + dy;
+                    if (yy < 0 || yy >= h)
+                    {
+                        keep = false;
+                        break;
+                    }
+
+                    for (int dx = -radius; dx <= radius; dx++)
+                    {
+                        int xx = x + dx;
+                        if (xx < 0 || xx >= w || !mask[yy * w + xx])
+                        {
+                            keep = false;
+                            break;
+                        }
+                    }
+                }
+
+                result[y * w + x] = keep;
+            }
+        }
+
+        return result;
+    }
+
+    static bool[] KeepLargestComponent(bool[] mask, int w, int h)
+    {
+        int n = mask.Length;
+        bool[] visited = new bool[n];
+        int[] queue = new int[n];
+        int[] current = new int[n];
+        int[] bestComponent = new int[n];
+        int bestCount = 0;
+
+        for (int start = 0; start < n; start++)
+        {
+            if (!mask[start] || visited[start])
+                continue;
+
+            int head = 0;
+            int tail = 0;
+            int count = 0;
+
+            queue[tail++] = start;
+            visited[start] = true;
+
+            while (head < tail)
+            {
+                int index = queue[head++];
+                current[count++] = index;
+
+                int x = index % w;
+                int y = index / w;
+
+                for (int dy = -1; dy <= 1; dy++)
+                {
+                    int yy = y + dy;
+                    if (yy < 0 || yy >= h)
+                        continue;
+
+                    for (int dx = -1; dx <= 1; dx++)
+                    {
+                        if (dx == 0 && dy == 0)
+                            continue;
+
+                        int xx = x + dx;
+                        if (xx < 0 || xx >= w)
+                            continue;
+
+                        int next = yy * w + xx;
+                        if (mask[next] && !visited[next])
+                        {
+                            visited[next] = true;
+                            queue[tail++] = next;
+                        }
+                    }
+                }
+            }
+
+            if (count > bestCount)
+            {
+                bestCount = count;
+                Array.Copy(current, bestComponent, count);
+            }
+        }
+
+        bool[] result = new bool[n];
+        for (int i = 0; i < bestCount; i++)
+            result[bestComponent[i]] = true;
+
+        return result;
+    }
+
+    static void FillHolesInPlace(bool[] mask, int w, int h)
+    {
+        bool[] outside = new bool[mask.Length];
+        int[] queue = new int[mask.Length];
+        int head = 0;
+        int tail = 0;
+
+        void AddOutsidePixel(int index)
+        {
+            if (!mask[index] && !outside[index])
+            {
+                outside[index] = true;
+                queue[tail++] = index;
+            }
+        }
+
+        for (int x = 0; x < w; x++)
+        {
+            AddOutsidePixel(x);
+            AddOutsidePixel((h - 1) * w + x);
+        }
+
+        for (int y = 0; y < h; y++)
+        {
+            AddOutsidePixel(y * w);
+            AddOutsidePixel(y * w + w - 1);
+        }
+
+        while (head < tail)
+        {
+            int index = queue[head++];
+            int x = index % w;
+            int y = index / w;
+
+            if (x > 0) AddOutsidePixel(index - 1);
+            if (x < w - 1) AddOutsidePixel(index + 1);
+            if (y > 0) AddOutsidePixel(index - w);
+            if (y < h - 1) AddOutsidePixel(index + w);
+        }
+
+        for (int i = 0; i < mask.Length; i++)
+        {
+            if (!mask[i] && !outside[i])
+                mask[i] = true;
+        }
+    }
+
+    static bool IsBrainBoundaryPixel(bool[] brainMask, int w, int h, int index)
+    {
+        if (!brainMask[index])
+            return true;
+
+        int x = index % w;
+        int y = index / w;
+
+        if (x == 0 || y == 0 || x == w - 1 || y == h - 1)
+            return true;
+
+        return
+            !brainMask[index - 1] ||
+            !brainMask[index + 1] ||
+            !brainMask[index - w] ||
+            !brainMask[index + w];
+    }
+
     // ============================================================
     //  IMAGE UTILITIES (unchanged)
     // ============================================================
@@ -642,7 +1151,7 @@ class Program
         return output;
     }
 
-    static unsafe Bitmap CreateGreenOverlay(Bitmap original, int[] labels, int tumorLabel)
+    static unsafe Bitmap CreateGreenOverlay(Bitmap original, bool[] highlightMask)
     {
         int w = original.Width;
         int h = original.Height;
@@ -665,7 +1174,7 @@ class Program
                 int p = x * 3;
                 int idx = y * w + x;
 
-                if (labels[idx] == tumorLabel)
+                if (highlightMask[idx])
                 {
                     drow[p] = 0;
                     drow[p + 1] = 255;
