@@ -28,11 +28,32 @@ This project implements and compares five brain tumor segmentation algorithms (K
 - https://www.kaggle.com/datasets/masoudnickparvar/brain-tumor-mri-dataset
 - https://www.kaggle.com/code/noorsaeed/99-mri-classification-with-grad-cam-segmentation
 
+The datasets include MRI scans of:
+- Glioma
+- Meningioma
+- Pituitary
+
 ## 📁 Project Structure
 ```
 TPC6323-Project/
 │
-├── 
+├── SLIC/                                               # SLIC Superpixels segmentation
+│   ├── Benchmark-focusOnAlgOnly/                       # BenchmarkDotNet performance evaluation (CPU, GPU, Sequential & Prototype)
+│   ├── Dataset/                                        # Brain MRI datasetssegmentation (glioma, meningioma & pituitary)
+│   ├── Grad-CAM-based pseudo ground truth/             # Pseudo ground truth generated using Grad-CAM (glioma, meningioma & pituitary)
+│   ├── Parallel Slic (Full Benchmark Check)/           # Parallel SLIC (CPU & GPU)
+│   ├── Prototype/K-Means-GPU                           # Prototype
+│   └── TPC Preprocessing/                              # Image preprocessing utilities (Dataset, Preprocess Dataset & Preprocessing Code)
+│
+├── Fuzzy_C_Means/                                      # Fuzzy C-Means  
+│   ├── TPC_Fuzzy_CPU                                   # CPU Parallel
+│   └── TPC_Fuzzy_GPU                                   # GPU Parallel 
+│
+├── GBS                                                 # Graph-Based Segmentation
+│   ├── backup/                                         # Backup source codes
+│   ├── GBS_CPU/                                        # CPU Parallel
+│   ├── GBS_GPU/                                        # GPU Parallel implementation (ILGPU)
+│   └── Sequential GBS/                                 # Sequential
 │
 └──
 ```
