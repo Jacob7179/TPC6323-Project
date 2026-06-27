@@ -1,4 +1,13 @@
 <h1 align="center">TPC6323-Project</h1>
+<p align="center">
+
+![C#](https://img.shields.io/badge/C%23-.NET-239120?style=for-the-badge&logo=c-sharp)
+![.NET LTS](https://img.shields.io/badge/.NET-10.0%20LTS-512BD4?style=for-the-badge&logo=dotnet&logoColor=white)
+![ILGPU](https://img.shields.io/badge/GPU-ILGPU-orange?style=for-the-badge)
+![BenchmarkDotNet](https://img.shields.io/badge/Benchmark-BenchmarkDotNet-blue?style=for-the-badge)
+![Platform](https://img.shields.io/badge/Platform-Windows-success?style=for-the-badge)
+
+</p>
 
 ## 📋 Project Overview
 
@@ -60,7 +69,7 @@ The objective is to analyse computational performance improvements achieved thro
 
 ---
 
-# 🛠 Technology Used
+# 🛠 Technology Stack
 
 | Category | Technology |
 |----------|------------|
@@ -73,14 +82,27 @@ The objective is to analyse computational performance improvements achieved thro
 
 ---
 
-## 📊 Dataset Used
-- https://www.kaggle.com/datasets/masoudnickparvar/brain-tumor-mri-dataset
-- https://www.kaggle.com/code/noorsaeed/99-mri-classification-with-grad-cam-segmentation
+## 📊 Dataset
 
-The datasets include MRI scans of:
-- Glioma
-- Meningioma
-- Pituitary
+The project uses publicly available Brain MRI datasets from **Kaggle**.
+
+### 📂 Dataset Sources
+
+- **Brain Tumor MRI Dataset**
+  - https://www.kaggle.com/datasets/masoudnickparvar/brain-tumor-mri-dataset
+
+- **Grad-CAM Segmentation Dataset**
+  - https://www.kaggle.com/code/noorsaeed/99-mri-classification-with-grad-cam-segmentation
+
+### 🧠 Tumour Classes
+
+| Class | Description |
+|------|-------------|
+| Glioma | Malignant brain tumour |
+| Meningioma | Tumour arising from the meninges |
+| Pituitary | Tumour located in the pituitary gland |
+
+---
 
 ## 📁 Project Structure
 ```
@@ -116,6 +138,8 @@ TPC6323-Project/
 └── Prototype/
     └── K-Means-GPU                             # Prototype (K-Means GPU Parallel)
 ```
+
+---
 
 ## 👥 Contributors
 
