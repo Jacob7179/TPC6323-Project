@@ -210,15 +210,18 @@ class Program
 
     static string GetTumorType(string fileName)
     {
-        string name = fileName.ToLowerInvariant();
+        string name = Path.GetFileNameWithoutExtension(fileName).ToLowerInvariant();
+        string[] parts = name.Split(
+            new[] { '-', '_', ' ', '.', '(', ')', '[', ']' },
+            StringSplitOptions.RemoveEmptyEntries);
 
-        if (name.Contains("tr-gl"))
+        if (parts.Contains("gl"))
             return "glioma";
 
-        if (name.Contains("tr-me") || name.Contains("tr-aug-me"))
+        if (parts.Contains("me"))
             return "meningioma";
 
-        if (name.Contains("tr-pi"))
+        if (parts.Contains("pi"))
             return "pituitary";
 
         return "unknown";
