@@ -1,0 +1,755 @@
+// GPU-Parallelism K-Means (perfect)
+using System;
+using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
+using ILGPU;
+using ILGPU.Runtime;
+
+class Program
+{
+    // const string BaseFolderPath = @"C:\Users\user\Downloads\Brain MRI\Training";
+    const string BaseFolderPath = @"E:\DatasetMSE\Dataset";
+    const string OutputFolderPath = @"C:\Users\user\Downloads\Segmented Output";
+    const string GroundTruthMaskFolderPath = @"E:\Grad-CAM-based pseudo ground truthMSE\Grad-CAM-based pseudo ground truth";
+
+    const int K = 3;
+    const int BlurRadius = 2;
+    const int MaxIterations = 20;
+
+    static void Main()
+    {
+        string inputFolder = Path.GetFullPath(BaseFolderPath);
+        if (!Directory.Exists(inputFolder))
+            throw new DirectoryNotFoundException(inputFolder);
+
+        Directory.CreateDirectory(OutputFolderPath);
+
+        string[] targetFolders = Directory.GetDirectories(inputFolder);
+
+        string[] files = targetFolders
+            .Where(Directory.Exists)
+            .SelectMany(folder =>
+                Directory.EnumerateFiles(folder, "*.*", SearchOption.AllDirectories))
+            .Where(IsSupportedImage)
+            .ToArray();
+
+        Console.WriteLine($"Found {files.Length} images");
+
+        using Context context = Context.CreateDefault();
+        using Accelerator accelerator =
+            context.GetPreferredDevice(preferCPU: false)
+                   .CreateAccelerator(context);
+
+        // MseSummary mseSummary = new();
+        DiceSummary diceSummary = new();
+
+        Console.WriteLine($"Using GPU: {accelerator.Name}");
+
+        // Load K-Means kernels
+        var assignKernel = accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<int>, int>(AssignClustersKernel);
+        var reduceKernel = accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<int>, int, ArrayView<float>, ArrayView<int>>(CentroidReduceKernel);
+        var normalizeKernel = accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<float>, ArrayView<int>, ArrayView<float>>(CentroidNormalizeKernel);
+
+        int totalImages = 0;
+        object consoleLock = new();
+        Stopwatch sw = Stopwatch.StartNew();
+
+        Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = 4 }, file =>
+        {
+            try
+            {
+                using Bitmap original = new Bitmap(file);
+                using Bitmap rgb = ConvertTo24Bit(original);
+
+                // CPU preprocessing
+                float[] gray = GetGrayBytes(rgb);
+                gray = GaussianBlurCPU(gray, rgb.Width, rgb.Height, BlurRadius);
+
+                // Run GPU K-Means
+                var (labels, centroids) = KMeansGPU(accelerator, assignKernel, reduceKernel, normalizeKernel, gray, rgb.Width, rgb.Height, K);
+
+                int tumorCluster = FindTumorCluster(labels, centroids, rgb.Width, rgb.Height);
+
+                using Bitmap overlay = CreateGreenOverlayFast(rgb, labels, tumorCluster);
+
+                string outputPath = Path.Combine(OutputFolderPath, Path.GetFileNameWithoutExtension(file) + "_tumor.png");
+                overlay.Save(outputPath, ImageFormat.Png);
+
+                bool[] predictedMask = new bool[labels.Length];
+
+                for (int i = 0; i < labels.Length; i++)
+                    predictedMask[i] = labels[i] == tumorCluster;
+
+                double? dice = EvaluateDiceAgainstGroundTruth(
+                    BaseFolderPath,
+                    GroundTruthMaskFolderPath,
+                    file,
+                    rgb.Width,
+                    rgb.Height,
+                    predictedMask);
+
+                diceSummary.Add(dice);
+
+                lock (consoleLock)
+                {
+                    Console.WriteLine(
+                        dice.HasValue
+                            ? $"Dice: {dice.Value:F4}"
+                            : "Dice: skipped (no ground truth)");
+                }
+
+                System.Threading.Interlocked.Increment(ref totalImages);
+                lock (consoleLock) Console.WriteLine($"Processed: {Path.GetFileName(file)}");
+            }
+            catch (Exception ex)
+            {
+                lock (consoleLock)
+                {
+                    Console.WriteLine($"Error: {Path.GetFileName(file)}");
+                    Console.WriteLine(ex.Message);
+                }
+            }
+        });
+
+        sw.Stop();
+        Console.WriteLine();
+        Console.WriteLine("=================================");
+        Console.WriteLine($"Total images : {totalImages}");
+        Console.WriteLine($"Total time   : {sw.Elapsed.TotalSeconds:F2} sec");
+        if (totalImages > 0)
+            Console.WriteLine($"Avg/image    : {sw.Elapsed.TotalMilliseconds / totalImages:F2} ms");
+            // PrintMseSummary(mseSummary);
+            PrintDiceSummary(diceSummary);
+        Console.WriteLine("=================================");
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    // =====================================================
+    // GPU K-MEANS (labels + centroids)
+    // =====================================================
+    static (int[] labels, float[] centroids) KMeansGPU(
+        Accelerator accelerator,
+        Action<Index1D, ArrayView<float>, ArrayView<float>, ArrayView<int>, int> assignKernel,
+        Action<Index1D, ArrayView<float>, ArrayView<int>, int, ArrayView<float>, ArrayView<int>> reduceKernel,
+        Action<Index1D, ArrayView<float>, ArrayView<int>, ArrayView<float>> normalizeKernel,
+        float[] grayPixels,
+        int width,
+        int height,
+        int k)
+    {
+        int n = width * height;
+
+        // CPU initial centroids (ONLY for first upload)
+        float[] centroidsInit = new float[k];
+        centroidsInit[0] = 40;
+        centroidsInit[1] = 120;
+        centroidsInit[2] = 220;
+
+        using var gpuPixels = accelerator.Allocate1D(grayPixels);
+        using var gpuLabels = accelerator.Allocate1D<int>(n);
+        using var gpuCentroids = accelerator.Allocate1D<float>(centroidsInit);
+        using var gpuSums = accelerator.Allocate1D<float>(k);
+        using var gpuCounts = accelerator.Allocate1D<int>(k);
+
+        for (int iter = 0; iter < MaxIterations; iter++)
+        {
+            assignKernel(n, gpuPixels.View, gpuCentroids.View, gpuLabels.View, k);
+            accelerator.Synchronize();
+
+            gpuSums.MemSetToZero();
+            gpuCounts.MemSetToZero();
+
+            reduceKernel(n, gpuPixels.View, gpuLabels.View, k, gpuSums.View, gpuCounts.View);
+            accelerator.Synchronize();
+
+            normalizeKernel(k, gpuSums.View, gpuCounts.View, gpuCentroids.View);
+            accelerator.Synchronize();
+        }
+
+        // FINAL READBACK ONLY
+        float[] centroids = gpuCentroids.GetAsArray1D();
+        int[] labels = gpuLabels.GetAsArray1D();
+
+        return (labels, centroids);
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    // =====================================================
+    // GPU KERNELS
+    // =====================================================
+    static void AssignClustersKernel(Index1D index, ArrayView<float> pixels, ArrayView<float> centroids, ArrayView<int> labels, int k)
+    {
+        if (index >= pixels.Length) return;
+        float pix = pixels[index];
+        float bestDist = float.MaxValue; int bestCluster = 0;
+        for (int c = 0; c < k; c++)
+        {
+            float d = pix - centroids[c]; d *= d;
+            if (d < bestDist) { bestDist = d; bestCluster = c; }
+        }
+        labels[index] = bestCluster;
+    }
+
+    static void CentroidReduceKernel(Index1D index, ArrayView<float> pixels, ArrayView<int> labels, int k, ArrayView<float> sums, ArrayView<int> counts)
+    {
+        if (index >= pixels.Length) return;
+        int label = labels[index];
+        ILGPU.Atomic.Add(ref sums[label], pixels[index]);
+        ILGPU.Atomic.Add(ref counts[label], 1);
+    }
+
+    static void CentroidNormalizeKernel(
+    Index1D index,
+    ArrayView<float> sums,
+    ArrayView<int> counts,
+    ArrayView<float> centroids)
+    {
+        if (index >= centroids.Length) return;
+
+        int count = counts[index];
+        if (count > 0)
+            centroids[index] = sums[index] / count;
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    // =====================================================
+    // CPU PREPROCESSING
+    // =====================================================
+    static float[] GetGrayBytes(Bitmap bmp)
+    {
+        int w = bmp.Width, h = bmp.Height;
+        float[] gray = new float[w * h];
+        BitmapData bmpData = bmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
+        unsafe
+        {
+            byte* ptr = (byte*)bmpData.Scan0;
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++)
+                {
+                    int p = y * bmpData.Stride + x * 3;
+                    byte b = ptr[p], g = ptr[p + 1], r = ptr[p + 2];
+                    gray[y * w + x] = 0.299f * r + 0.587f * g + 0.114f * b;
+                }
+        }
+        bmp.UnlockBits(bmpData);
+        return gray;
+    }
+
+    static float[] GaussianBlurCPU(float[] img, int w, int h, int r)
+    {
+        if (r == 0) return img;
+
+        float sigma = r / 2f;
+        float twoSigma2 = 2 * sigma * sigma;
+        float[] kernel = new float[r * 2 + 1];
+        for (int i = -r; i <= r; i++) kernel[i + r] = MathF.Exp(-(i * i) / twoSigma2);
+        float sumK = kernel.Sum();
+        for (int i = 0; i < kernel.Length; i++) kernel[i] /= sumK;
+
+        float[] tmp = new float[w * h];
+        // Horizontal blur
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                float s = 0;
+                for (int k = -r; k <= r; k++)
+                {
+                    int xx = Math.Clamp(x + k, 0, w - 1);
+                    s += img[y * w + xx] * kernel[k + r];
+                }
+                tmp[y * w + x] = s;
+            }
+
+        float[] res = new float[w * h];
+        // Vertical blur
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                float s = 0;
+                for (int k = -r; k <= r; k++)
+                {
+                    int yy = Math.Clamp(y + k, 0, h - 1);
+                    s += tmp[yy * w + x] * kernel[k + r];
+                }
+                res[y * w + x] = s;
+            }
+
+        return res;
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    // =====================================================
+    // UTILITIES
+    // =====================================================
+    static bool IsSupportedImage(string path)
+    {
+        string ext = Path.GetExtension(path).ToLowerInvariant();
+        return ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".bmp";
+    }
+
+    static Bitmap ConvertTo24Bit(Bitmap src)
+    {
+        Bitmap bmp = new(src.Width, src.Height, PixelFormat.Format24bppRgb);
+        using Graphics g = Graphics.FromImage(bmp);
+        g.DrawImage(src, 0, 0);
+        return bmp;
+    }
+
+    static int FindTumorCluster(int[] labels, float[] centroids, int w, int h)
+    {
+        int k = centroids.Length;
+        int[] counts = new int[k];
+        foreach (int label in labels) counts[label]++;
+        int bestCluster = 0; float bestScore = float.MinValue;
+        for (int c = 0; c < k; c++)
+        {
+            float brightness = centroids[c];
+            float sizePenalty = counts[c] / (float)(w * h);
+            float score = brightness - sizePenalty * 120f;
+            if (score > bestScore) { bestScore = score; bestCluster = c; }
+        }
+        return bestCluster;
+    }
+
+    static unsafe Bitmap CreateGreenOverlayFast(Bitmap original, int[] labels, int tumorCluster)
+    {
+        int w = original.Width, h = original.Height;
+        Bitmap result = new(w, h, PixelFormat.Format24bppRgb);
+        BitmapData src = original.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
+        BitmapData dst = result.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.WriteOnly, PixelFormat.Format24bppRgb);
+        byte* sp = (byte*)src.Scan0;
+        byte* dp = (byte*)dst.Scan0;
+
+        Parallel.For(0, h, y =>
+        {
+            byte* srow = sp + y * src.Stride;
+            byte* drow = dp + y * dst.Stride;
+            int baseIdx = y * w;
+            for (int x = 0; x < w; x++)
+            {
+                int i = baseIdx + x, p = x * 3;
+                byte b = srow[p], g = srow[p + 1], r = srow[p + 2];
+                byte gray = (byte)(0.299f * r + 0.587f * g + 0.114f * b);
+
+                if (labels[i] == tumorCluster)
+                {
+                    drow[p] = (byte)(gray * 0.3f);
+                    drow[p + 1] = 255;
+                    drow[p + 2] = (byte)(gray * 0.3f);
+                }
+                else
+                {
+                    drow[p] = gray; drow[p + 1] = gray; drow[p + 2] = gray;
+                }
+            }
+        });
+
+        original.UnlockBits(src); result.UnlockBits(dst);
+        return result;
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    static double? EvaluateMseAgainstGroundTruth(
+    string inputFolder,
+    string groundTruthFolder,
+    string inputPath,
+    int width,
+    int height,
+    bool[] predictedMask)
+    {
+        string? gtPath = FindGroundTruthMaskPath(inputFolder, groundTruthFolder, inputPath);
+
+        if (gtPath == null)
+            return null;
+
+        return CalculateMse(predictedMask, width, height, gtPath);
+    }
+
+    static string? FindGroundTruthMaskPath(
+    string inputFolder,
+    string groundTruthFolder,
+    string inputPath)
+    {
+        string relativeFolder =
+            Path.GetDirectoryName(Path.GetRelativePath(inputFolder, inputPath)) ?? "";
+
+        string maskFolder = Path.Combine(groundTruthFolder, relativeFolder);
+
+        if (!Directory.Exists(maskFolder))
+            return null;
+
+        string stem = Path.GetFileNameWithoutExtension(inputPath);
+
+        string[] candidates =
+        {
+        stem + "_mask",
+        stem + "_gradcam",
+        stem
+    };
+
+        string[] exts = { ".png", ".jpg", ".jpeg", ".bmp" };
+
+        foreach (var c in candidates)
+            foreach (var e in exts)
+            {
+                string path = Path.Combine(maskFolder, c + e);
+                if (File.Exists(path))
+                    return path;
+            }
+
+        return Directory
+            .EnumerateFiles(maskFolder, "*.*")
+            .FirstOrDefault(IsSupportedImage);
+    }
+
+
+    static double CalculateMse(
+    bool[] predictedMask,
+    int width,
+    int height,
+    string gtPath)
+    {
+        using Bitmap source = new Bitmap(gtPath);
+
+        using Bitmap gt = new Bitmap(width, height, PixelFormat.Format24bppRgb);
+
+        using (Graphics g = Graphics.FromImage(gt))
+            g.DrawImage(source, new Rectangle(0, 0, width, height));
+
+        BitmapData data = gt.LockBits(
+            new Rectangle(0, 0, width, height),
+            ImageLockMode.ReadOnly,
+            PixelFormat.Format24bppRgb);
+
+        double error = 0;
+
+        unsafe
+        {
+            byte* ptr = (byte*)data.Scan0;
+
+            for (int y = 0; y < height; y++)
+            {
+                byte* row = ptr + y * data.Stride;
+
+                for (int x = 0; x < width; x++)
+                {
+                    int i = y * width + x;
+                    int p = x * 3;
+
+                    byte b = row[p];
+                    byte g = row[p + 1];
+                    byte r = row[p + 2];
+
+                    double gtValue =
+                        0.299 * r + 0.587 * g + 0.114 * b;
+
+                    double pred = predictedMask[i] ? 255 : 0;
+
+                    double diff = pred - gtValue;
+
+                    error += diff * diff;
+                }
+            }
+        }
+
+        gt.UnlockBits(data);
+
+        return error / predictedMask.Length;
+    }
+
+
+
+
+
+    class MseSummary
+    {
+        public double Total { get; private set; }
+        public double Min { get; private set; } = double.MaxValue;
+        public double Max { get; private set; }
+        public int Count { get; private set; }
+        public int Skipped { get; private set; }
+
+        public double Average => Count == 0 ? 0 : Total / Count;
+
+        public void Add(double? mse)
+        {
+            if (!mse.HasValue)
+            {
+                Skipped++;
+                return;
+            }
+
+            Count++;
+            Total += mse.Value;
+
+            Min = Math.Min(Min, mse.Value);
+            Max = Math.Max(Max, mse.Value);
+        }
+    }
+
+    class DiceSummary
+    {
+        public double Total { get; private set; }
+        public double Min { get; private set; } = double.MaxValue;
+        public double Max { get; private set; }
+        public int Count { get; private set; }
+        public int Skipped { get; private set; }
+
+        public double Average => Count == 0 ? 0 : Total / Count;
+
+        public void Add(double? dice)
+        {
+            if (!dice.HasValue)
+            {
+                Skipped++;
+                return;
+            }
+
+            Count++;
+            Total += dice.Value;
+
+            Min = Math.Min(Min, dice.Value);
+            Max = Math.Max(Max, dice.Value);
+        }
+    }
+
+    static void PrintMseSummary(MseSummary s)
+    {
+        Console.WriteLine("\n========== MSE ==========");
+        Console.WriteLine($"Images evaluated : {s.Count}");
+        Console.WriteLine($"Skipped          : {s.Skipped}");
+
+        if (s.Count > 0)
+        {
+            Console.WriteLine($"Average MSE      : {s.Average:F2}");
+            Console.WriteLine($"Min MSE          : {s.Min:F2}");
+            Console.WriteLine($"Max MSE          : {s.Max:F2}");
+        }
+
+        Console.WriteLine("=========================\n");
+    }
+
+    static void PrintDiceSummary(DiceSummary s)
+    {
+        Console.WriteLine("\n========== DICE ==========");
+        Console.WriteLine($"Images evaluated : {s.Count}");
+        Console.WriteLine($"Skipped          : {s.Skipped}");
+
+        if (s.Count > 0)
+        {
+            Console.WriteLine($"Average Dice     : {s.Average:F4}");
+            Console.WriteLine($"Min Dice         : {s.Min:F4}");
+            Console.WriteLine($"Max Dice         : {s.Max:F4}");
+        }
+
+        Console.WriteLine("==========================\n");
+    }
+
+    static double? EvaluateDiceAgainstGroundTruth(
+    string inputFolder,
+    string groundTruthFolder,
+    string inputPath,
+    int width,
+    int height,
+    bool[] predictedMask)
+    {
+        string? gtPath = FindGroundTruthMaskPath(inputFolder, groundTruthFolder, inputPath);
+
+        if (gtPath == null)
+            return null;
+
+        return CalculateDice(predictedMask, width, height, gtPath);
+    }
+
+    static double CalculateDice(
+    bool[] predictedMask,
+    int width,
+    int height,
+    string gtPath)
+    {
+        using Bitmap source = new Bitmap(gtPath);
+
+        using Bitmap gt = new Bitmap(width, height, PixelFormat.Format24bppRgb);
+
+        using (Graphics g = Graphics.FromImage(gt))
+            g.DrawImage(source, new Rectangle(0, 0, width, height));
+
+        BitmapData data = gt.LockBits(
+            new Rectangle(0, 0, width, height),
+            ImageLockMode.ReadOnly,
+            PixelFormat.Format24bppRgb);
+
+        long tp = 0, fp = 0, fn = 0;
+
+        unsafe
+        {
+            byte* ptr = (byte*)data.Scan0;
+
+            for (int y = 0; y < height; y++)
+            {
+                byte* row = ptr + y * data.Stride;
+
+                for (int x = 0; x < width; x++)
+                {
+                    int i = y * width + x;
+                    int p = x * 3;
+
+                    byte b = row[p];
+                    byte g = row[p + 1];
+                    byte r = row[p + 2];
+
+                    double gtValue = 0.299 * r + 0.587 * g + 0.114 * b;
+
+                    bool gtMask = gtValue > 128;   // IMPORTANT thresholding
+                    bool predMask = predictedMask[i];
+
+                    if (predMask && gtMask) tp++;
+                    else if (predMask && !gtMask) fp++;
+                    else if (!predMask && gtMask) fn++;
+                }
+            }
+        }
+
+        gt.UnlockBits(data);
+
+        double dice = (2.0 * tp) / (2.0 * tp + fp + fn + 1e-8);
+        return dice;
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+}
