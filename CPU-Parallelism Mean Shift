@@ -1,0 +1,268 @@
+// CPU-Parallel Mean Shift
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Threading.Tasks;
+
+namespace MeanShiftMRI
+{
+    public class Point
+    {
+        public double[] Features;
+
+        public Point(double[] features)
+        {
+            Features = features;
+        }
+
+        public static double DistanceSquared(Point a, Point b)
+        {
+            double sum = 0;
+            for (int i = 0; i < a.Features.Length; i++)
+            {
+                double d = a.Features[i] - b.Features[i];
+                sum += d * d;
+            }
+            return sum;
+        }
+    }
+
+    public class MeanShift
+    {
+        private double bandwidth;
+        private double bandwidth2;
+        private int gridSize;
+
+        private Dictionary<(int, int), List<Point>> grid;
+
+        public MeanShift(double bandwidth)
+        {
+            this.bandwidth = bandwidth;
+            this.bandwidth2 = bandwidth * bandwidth;
+            this.gridSize = (int)bandwidth;
+        }
+
+        private (int, int) GetCell(Point p)
+        {
+            return ((int)(p.Features[0] / gridSize),
+                    (int)(p.Features[1] / gridSize));
+        }
+
+        private void BuildGrid(List<Point> points)
+        {
+            grid = new Dictionary<(int, int), List<Point>>();
+
+            foreach (var p in points)
+            {
+                var cell = GetCell(p);
+
+                if (!grid.ContainsKey(cell))
+                    grid[cell] = new List<Point>();
+
+                grid[cell].Add(p);
+            }
+        }
+
+        private List<Point> GetNeighbors(Point mean)
+        {
+            var cell = GetCell(mean);
+            List<Point> result = new List<Point>();
+
+            for (int dx = -1; dx <= 1; dx++)
+                for (int dy = -1; dy <= 1; dy++)
+                {
+                    var key = (cell.Item1 + dx, cell.Item2 + dy);
+
+                    if (grid.ContainsKey(key))
+                        result.AddRange(grid[key]);
+                }
+
+            return result;
+        }
+
+        public List<Point> Fit(List<Point> points)
+        {
+            BuildGrid(points);
+
+            ConcurrentBag<Point> clusterCenters = new ConcurrentBag<Point>();
+
+            Parallel.For(0, points.Count / 5, i =>
+            {
+                int index = i * 5;
+
+                if (index >= points.Count)
+                    return;
+
+                Point mean = new Point((double[])points[index].Features.Clone());
+
+                int iter = 0;
+                bool converged = false;
+
+                while (!converged && iter < 10)
+                {
+                    var neighbors = GetNeighbors(mean);
+
+                    double[] newMean = new double[mean.Features.Length];
+                    int count = 0;
+
+                    foreach (var p in neighbors)
+                    {
+                        if (Point.DistanceSquared(mean, p) <= bandwidth2)
+                        {
+                            for (int d = 0; d < newMean.Length; d++)
+                                newMean[d] += p.Features[d];
+
+                            count++;
+                        }
+                    }
+
+                    if (count == 0) break;
+
+                    for (int d = 0; d < newMean.Length; d++)
+                        newMean[d] /= count;
+
+                    double shift = 0;
+
+                    for (int d = 0; d < newMean.Length; d++)
+                    {
+                        double diff = newMean[d] - mean.Features[d];
+                        shift += diff * diff;
+                    }
+
+                    mean = new Point(newMean);
+
+                    if (shift < 1e-3)
+                        converged = true;
+
+                    iter++;
+                }
+
+                clusterCenters.Add(mean);
+            });
+
+            return clusterCenters.ToList();
+        }
+    }
+
+    class Program
+    {
+        const string BaseFolderPath = @"C:\Users\user\Downloads\Brain MRI\Training";
+        const string OutputFolderPath = @"C:\Users\user\Downloads\Segmented Output";
+
+        static void Main(string[] args)
+        {
+            var totalWatch = Stopwatch.StartNew(); // 🔥 START FULL PIPELINE TIMER
+
+            string inputFolder = Path.GetFullPath(BaseFolderPath);
+
+            Directory.CreateDirectory(OutputFolderPath);
+
+            string[] targetFolders = new[]
+            {
+                Path.Combine(inputFolder, "glioma"),
+                Path.Combine(inputFolder, "pituitary"),
+                Path.Combine(inputFolder, "meningioma")
+            };
+
+            var random = new Random(42);
+
+            // take per class (balanced sampling)
+            string[] glioma = Directory.GetFiles(targetFolders[0], "*.*", SearchOption.AllDirectories)
+                .Where(IsSupportedImage)
+                .OrderBy(_ => random.Next())
+                .Take(33)
+                .ToArray();
+
+            string[] pituitary = Directory.GetFiles(targetFolders[1], "*.*", SearchOption.AllDirectories)
+                .Where(IsSupportedImage)
+                .OrderBy(_ => random.Next())
+                .Take(33)
+                .ToArray();
+
+            string[] meningioma = Directory.GetFiles(targetFolders[2], "*.*", SearchOption.AllDirectories)
+                .Where(IsSupportedImage)
+                .OrderBy(_ => random.Next())
+                .Take(34)
+                .ToArray();
+
+            // merge final dataset (100 images total)
+            string[] files = glioma
+                .Concat(pituitary)
+                .Concat(meningioma)
+                .ToArray();
+
+            Console.WriteLine($"Balanced dataset size: {files.Length}");
+
+            Console.WriteLine($"Found {files.Length} images");
+
+            Parallel.ForEach(files.Take(100), file =>
+            {
+                Console.WriteLine($"Processing: {Path.GetFileName(file)}");
+
+                var pixels = LoadImageFast(file);
+
+                MeanShift ms = new MeanShift(25);
+
+                var result = ms.Fit(pixels);
+
+                Console.WriteLine($"Clusters: {result.Count}");
+            });
+
+            totalWatch.Stop(); // 🔥 STOP FULL PIPELINE TIMER
+
+            Console.WriteLine($"Done.");
+            Console.WriteLine($"Total end-to-end time: {totalWatch.Elapsed.TotalSeconds:F2} seconds");
+        }
+
+        static List<Point> LoadImageFast(string path)
+        {
+            Bitmap bmp = new Bitmap(path);
+
+            var rect = new Rectangle(0, 0, bmp.Width, bmp.Height);
+            BitmapData data = bmp.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
+
+            int stride = data.Stride;
+            IntPtr scan0 = data.Scan0;
+
+            byte[] buffer = new byte[stride * bmp.Height];
+            Marshal.Copy(scan0, buffer, 0, buffer.Length);
+
+            List<Point> points = new List<Point>();
+
+            for (int y = 0; y < bmp.Height; y += 2)
+                for (int x = 0; x < bmp.Width; x += 2)
+                {
+                    int idx = (y * stride) + (x * 3);
+
+                    byte b = buffer[idx];
+                    byte g = buffer[idx + 1];
+                    byte r = buffer[idx + 2];
+
+                    double intensity = (r + g + b) / 3.0;
+
+                    points.Add(new Point(new double[]
+                    {
+                        x, y, intensity
+                    }));
+                }
+
+            bmp.UnlockBits(data);
+            bmp.Dispose();
+
+            return points;
+        }
+
+        static bool IsSupportedImage(string file)
+        {
+            string ext = Path.GetExtension(file).ToLower();
+            return ext is ".jpg" or ".png" or ".jpeg" or ".bmp";
+        }
+    }
+}
