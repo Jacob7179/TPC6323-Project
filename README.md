@@ -94,8 +94,8 @@ TPC6323-Project/
 │   └── TPC Preprocessing/                      # Image preprocessing utilities (Dataset, Preprocess Dataset & Preprocessing Code)
 │
 ├── Fuzzy_C_Means/                              # Fuzzy C-Means (Algorithm)
-│   ├── TPC_Fuzzy_CPU                           # CPU Parallel
-│   └── TPC_Fuzzy_GPU                           # GPU Parallel 
+│   ├── TPC_Fuzzy_CPU/                          # CPU Parallel
+│   └── TPC_Fuzzy_GPU/                          # GPU Parallel 
 │
 ├── GBS/                                        # Graph-Based Segmentation (Algorithm)
 │   ├── backup/                                 # Backup source codes
@@ -110,9 +110,8 @@ TPC6323-Project/
 │   └── K-Means Benchmark                       # BenchmarkDotNet performance evaluation
 │
 ├── Mean_Shift/                                 # Mean Shift segmentation (Algorithm)
-│   ├──
-│   └── 
-│
+│   ├── CPU-Parallelism Mean Shift              # CPU Parallel
+│   └── GPU-Parallelism Mean Shift              # GPU Parallel
 │
 └── Prototype/
     └── K-Means-GPU                             # Prototype (K-Means GPU Parallel)
